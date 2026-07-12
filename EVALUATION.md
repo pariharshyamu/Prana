@@ -162,14 +162,14 @@ concretely shows Phases 1–3 are feasible and what the layering looks like:
 | Crate | Mirrors in Cactus | Shows |
 |-------|-------------------|-------|
 | `prana-tensor` | `BufferDesc`, `BufferPool` (`core.cpp`) | dtype-erased tensors + a size-bucketed buffer pool with **zero `unsafe`** (`#![forbid(unsafe_code)]`) — the manual pointer-nulling move-ctor becomes compiler-tracked ownership |
-| `prana-kernels` | `matmul.cpp`, `quants.cpp`, `norms_rope.cpp`, `threading.h` | Q8 block-quantized matmul, dense matmul, RMSNorm, softmax, and a `thread::scope` `parallel_for`; scalar autovectorized *default* tier with a documented seam for a NEON/AVX `unsafe` tier |
+| `prana-kernels` | `matmul.cpp`, `quants.cpp`, `norms_rope.cpp`, `threading.h` | Q8 block-quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, and a `thread::scope` `parallel_for`; scalar autovectorized *default* tier with a documented seam for a NEON/AVX `unsafe` tier |
 | `prana-graph` | `CactusGraph` (`builder.cpp`, `execute.cpp`) | define-then-run graph where node handles are checked indices, ops validate shapes, and an unbound input yields a typed `Result` error instead of UB |
-| `prana-cli` | `cactus run` / `cactus benchmark` | runs a transformer-style block end-to-end and microbenchmarks the decode-path matmul |
+| `prana-cli` | `cactus run` / `cactus benchmark` | runs a **complete transformer block** (norm → QKV → RoPE → causal GQA attention → residual → MLP) end-to-end and microbenchmarks the decode-path matmul |
 
 Everything above the kernel boundary is `#![forbid(unsafe_code)]`. Run it:
 
 ```bash
-cargo test              # 17 tests across the workspace
+cargo test              # 23 tests across the workspace
 cargo run --release -p prana-cli -- demo
 cargo run --release -p prana-cli -- bench
 ```

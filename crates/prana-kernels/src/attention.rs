@@ -1,0 +1,203 @@
+//! Rotary position embedding (RoPE) and scaled-dot-product attention — the
+//! remaining core of a transformer block beyond matmul/norm.
+//!
+//! Cactus implements these in `cactus-kernels/src/norms_rope.cpp` (RoPE) and a
+//! fused attention kernel with a Metal fast path. The numerics here are the
+//! standard ones (Llama-style `rotate_half` RoPE, causal masked softmax
+//! attention with grouped-query support); the point is that the whole thing is
+//! expressible in safe, autovectorizable Rust with an obvious seam for a
+//! target-gated SIMD/Metal tier behind the same signatures.
+//!
+//! Layout convention (seq-major, matching a matmul output `[seq, features]`):
+//! Q is `[seq_q, n_heads * head_dim]`, K/V are `[seq_kv, n_kv_heads * head_dim]`,
+//! all row-major. This is the layout the projection matmuls produce directly.
+
+use crate::norms::softmax;
+
+/// Apply Llama-style `rotate_half` RoPE in place to a `[seq, n_heads * head_dim]`
+/// tensor. Position `p` for row index `p` (0-based), pairing dim `j` with
+/// `j + head_dim/2`. `head_dim` must be even.
+///
+/// `theta_base` is the usual RoPE base (10000.0 for most models).
+pub fn rope(x: &mut [f32], seq: usize, n_heads: usize, head_dim: usize, theta_base: f32) {
+    assert_eq!(head_dim % 2, 0, "head_dim must be even for RoPE");
+    assert_eq!(x.len(), seq * n_heads * head_dim);
+    let half = head_dim / 2;
+    let row_stride = n_heads * head_dim;
+
+    for p in 0..seq {
+        for h in 0..n_heads {
+            let base = p * row_stride + h * head_dim;
+            for j in 0..half {
+                // freq = theta_base^(-2j/head_dim); angle = p * freq.
+                let freq = (theta_base).powf(-(2.0 * j as f32) / head_dim as f32);
+                let angle = p as f32 * freq;
+                let (sin, cos) = angle.sin_cos();
+                let x1 = x[base + j];
+                let x2 = x[base + j + half];
+                x[base + j] = x1 * cos - x2 * sin;
+                x[base + j + half] = x1 * sin + x2 * cos;
+            }
+        }
+    }
+}
+
+/// Causal scaled-dot-product self-attention.
+///
+/// `q`  is `[seq, n_heads * head_dim]`,
+/// `k`/`v` are `[seq, n_kv_heads * head_dim]` (same seq — a single forward pass /
+/// prefill window). `n_heads` must be a multiple of `n_kv_heads` (grouped-query
+/// attention; set them equal for classic multi-head).
+///
+/// Returns `[seq, n_heads * head_dim]`. Every query position `i` attends only to
+/// key positions `t <= i` (causal mask), softmax-normalized, scaled by
+/// `1/sqrt(head_dim)`.
+pub fn attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    assert_eq!(q.len(), seq * n_heads * head_dim);
+    assert_eq!(k.len(), seq * n_kv_heads * head_dim);
+    assert_eq!(v.len(), seq * n_kv_heads * head_dim);
+    assert!(n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads), "n_heads must be a multiple of n_kv_heads");
+
+    let group = n_heads / n_kv_heads; // query heads per kv head
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let q_stride = n_heads * head_dim;
+    let kv_stride = n_kv_heads * head_dim;
+    let mut out = vec![0f32; seq * q_stride];
+
+    for i in 0..seq {
+        for h in 0..n_heads {
+            let kv_h = h / group;
+            let q_vec = &q[i * q_stride + h * head_dim..i * q_stride + h * head_dim + head_dim];
+
+            // Scores against all causal-visible keys (t <= i).
+            let mut scores = vec![0f32; i + 1];
+            for (t, s) in scores.iter_mut().enumerate() {
+                let k_vec =
+                    &k[t * kv_stride + kv_h * head_dim..t * kv_stride + kv_h * head_dim + head_dim];
+                let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
+                *s = dot * scale;
+            }
+
+            let probs = softmax(&scores);
+
+            // Weighted sum of value vectors.
+            let dst = &mut out[i * q_stride + h * head_dim..i * q_stride + h * head_dim + head_dim];
+            for (t, &p) in probs.iter().enumerate() {
+                let v_vec =
+                    &v[t * kv_stride + kv_h * head_dim..t * kv_stride + kv_h * head_dim + head_dim];
+                for (d, &vv) in dst.iter_mut().zip(v_vec) {
+                    *d += p * vv;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rope_preserves_norm_per_pair() {
+        // A rotation preserves the length of each (x1, x2) pair.
+        let seq = 3;
+        let n_heads = 2;
+        let head_dim = 4;
+        let mut x: Vec<f32> =
+            (0..seq * n_heads * head_dim).map(|i| (i as f32 * 0.1).sin() + 0.3).collect();
+        let before = x.clone();
+        rope(&mut x, seq, n_heads, head_dim, 10000.0);
+
+        let half = head_dim / 2;
+        for p in 0..seq {
+            for h in 0..n_heads {
+                let base = (p * n_heads + h) * head_dim;
+                for j in 0..half {
+                    let n0 = before[base + j].powi(2) + before[base + j + half].powi(2);
+                    let n1 = x[base + j].powi(2) + x[base + j + half].powi(2);
+                    assert!((n0 - n1).abs() < 1e-5, "pair norm changed: {n0} vs {n1}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rope_is_identity_at_position_zero() {
+        // Angle = 0 for p=0, so the first row must be unchanged.
+        let head_dim = 8;
+        let mut x: Vec<f32> = (0..head_dim).map(|i| i as f32).collect();
+        let before = x.clone();
+        rope(&mut x, 1, 1, head_dim, 10000.0);
+        for (a, b) in before.iter().zip(&x) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn attention_rows_are_convex_combinations_of_v() {
+        // With causal masking, position 0 attends only to itself, so out[0] == v[0].
+        let seq = 4;
+        let n_heads = 2;
+        let head_dim = 3;
+        let q: Vec<f32> = (0..seq * n_heads * head_dim).map(|i| (i as f32 * 0.05).cos()).collect();
+        let k: Vec<f32> = (0..seq * n_heads * head_dim).map(|i| (i as f32 * 0.03).sin()).collect();
+        let v: Vec<f32> = (0..seq * n_heads * head_dim).map(|i| (i as f32 * 0.02).cos()).collect();
+        let out = attention(&q, &k, &v, seq, n_heads, n_heads, head_dim);
+
+        // First query position sees only key/value 0 -> output equals v[0] per head.
+        for h in 0..n_heads {
+            for d in 0..head_dim {
+                let o = out[h * head_dim + d];
+                let expected = v[h * head_dim + d];
+                assert!((o - expected).abs() < 1e-5, "pos0 head{h} dim{d}: {o} vs {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn attention_output_is_bounded_by_v_range() {
+        // A softmax-weighted average can never exceed the min/max of the values
+        // it averages, a good invariant that catches masking/scaling bugs.
+        let seq = 5;
+        let n_heads = 1;
+        let head_dim = 4;
+        let q: Vec<f32> = (0..seq * head_dim).map(|i| (i as f32 * 0.2).sin()).collect();
+        let k: Vec<f32> = (0..seq * head_dim).map(|i| (i as f32 * 0.15).cos()).collect();
+        let v: Vec<f32> = (0..seq * head_dim).map(|i| (i as f32 * 0.1).sin()).collect();
+        let out = attention(&q, &k, &v, seq, n_heads, n_heads, head_dim);
+
+        for i in 0..seq {
+            // Values visible to position i are rows 0..=i.
+            let visible = &v[0..(i + 1) * head_dim];
+            let vmin = visible.iter().copied().fold(f32::INFINITY, f32::min);
+            let vmax = visible.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            for d in 0..head_dim {
+                let o = out[i * head_dim + d];
+                assert!(o >= vmin - 1e-5 && o <= vmax + 1e-5, "out {o} not in [{vmin},{vmax}]");
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_query_attention_shapes_work() {
+        // 4 query heads sharing 2 kv heads (GQA) must produce full q-shaped output.
+        let seq = 3;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 2;
+        let q: Vec<f32> = (0..seq * n_heads * head_dim).map(|i| i as f32 * 0.01).collect();
+        let k: Vec<f32> = (0..seq * n_kv_heads * head_dim).map(|i| i as f32 * 0.02).collect();
+        let v: Vec<f32> = (0..seq * n_kv_heads * head_dim).map(|i| i as f32 * 0.03).collect();
+        let out = attention(&q, &k, &v, seq, n_heads, n_kv_heads, head_dim);
+        assert_eq!(out.len(), seq * n_heads * head_dim);
+    }
+}

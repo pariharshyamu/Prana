@@ -20,10 +20,12 @@
 //! This file ships tier 1 so the prototype builds and runs on any host,
 //! including the x86_64 CI box this was developed on.
 
+mod attention;
 mod matmul;
 mod norms;
 mod threading;
 
+pub use attention::{attention, rope};
 pub use matmul::{dequantize_q8, matmul_f32, matmul_q8_f32, quantize_q8, QuantMatrix, Q8_BLOCK};
 pub use norms::{rmsnorm, softmax};
 pub use threading::parallel_for;

@@ -26,35 +26,60 @@ fn main() {
     }
 }
 
-/// Run one normalize -> project -> residual -> softmax block and print a summary.
+/// Run one full transformer block — attention sub-layer (norm -> QKV -> RoPE ->
+/// causal attention -> residual) followed by an MLP sub-layer (norm -> up ->
+/// down -> residual) — over a short token sequence, then print a summary.
 fn demo() {
-    println!("== Prana demo: one transformer-style block ==\n");
-    let dim = 64;
+    println!("== Prana demo: one full transformer block (prefill, seq=8) ==\n");
+
+    let seq = 8;
+    let n_heads = 4;
+    let n_kv_heads = 2; // grouped-query attention, like Llama-3 / Qwen2
+    let head_dim = 16;
+    let dim = n_heads * head_dim; // model width = 64
+    let ffn = dim * 2; // MLP hidden width
+
+    // Deterministic pseudo-weights so the demo is reproducible.
+    let mat = |rows: usize, cols: usize, seed: f32| -> Vec<f32> {
+        (0..rows * cols).map(|i| (i as f32 * seed).sin() * 0.1).collect()
+    };
+
     let mut g = Graph::new();
-    let x = g.input(1);
+    let x = g.input(seq);
 
-    let n = g.rmsnorm(x, vec![1.0; dim], dim, 1e-5);
-    let w: Vec<f32> = (0..dim * dim).map(|i| (i as f32 * 0.001).sin()).collect();
-    let proj = g.matmul_f32(n, w, dim, dim);
-    let res = g.add(proj, x);
-    let out = g.softmax(res);
+    // --- Attention sub-layer ---
+    let n1 = g.rmsnorm(x, vec![1.0; dim], dim, 1e-5);
+    let q0 = g.matmul_f32(n1, mat(dim, dim, 0.0011), dim, dim);
+    let k0 = g.matmul_f32(n1, mat(n_kv_heads * head_dim, dim, 0.0013), dim, n_kv_heads * head_dim);
+    let v0 = g.matmul_f32(n1, mat(n_kv_heads * head_dim, dim, 0.0017), dim, n_kv_heads * head_dim);
+    let q = g.rope(q0, n_heads, head_dim, 10000.0);
+    let k = g.rope(k0, n_kv_heads, head_dim, 10000.0);
+    let attn = g.attention(q, k, v0, n_heads, n_kv_heads, head_dim);
+    let o_proj = g.matmul_f32(attn, mat(dim, dim, 0.0019), dim, dim);
+    let res1 = g.add(o_proj, x);
 
-    let input: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.05).sin()).collect();
-    g.set_input(x, Tensor::from_f32(vec![1, dim], &input));
+    // --- MLP sub-layer ---
+    let n2 = g.rmsnorm(res1, vec![1.0; dim], dim, 1e-5);
+    let up = g.matmul_f32(n2, mat(ffn, dim, 0.0007), dim, ffn);
+    let down = g.matmul_f32(up, mat(dim, ffn, 0.0009), ffn, dim);
+    let out = g.add(down, res1);
+
+    let input: Vec<f32> = (0..seq * dim).map(|i| (i as f32 * 0.01).sin()).collect();
+    g.set_input(x, Tensor::from_f32(vec![seq, dim], &input));
     g.execute().expect("graph executed");
 
-    let probs = g.output_f32(out).expect("f32 output");
-    let argmax = probs
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .map(|(i, _)| i)
-        .unwrap();
-    println!("  input dim         : {dim}");
-    println!("  output is a distribution over {} logits", probs.len());
-    println!("  sum(probs)        : {:.6} (should be 1.0)", probs.iter().sum::<f32>());
-    println!("  argmax index      : {argmax}");
-    println!("\nAll layers ran with zero `unsafe` above the kernel boundary.");
+    let y = g.output_f32(out).expect("f32 output");
+    let finite = y.iter().all(|v| v.is_finite());
+    let rms = (y.iter().map(|v| v * v).sum::<f32>() / y.len() as f32).sqrt();
+
+    println!("  config            : dim={dim}  heads={n_heads}  kv_heads={n_kv_heads} (GQA)  head_dim={head_dim}");
+    println!("  sequence          : {seq} tokens (causal self-attention)");
+    println!("  hidden state out  : [{seq} x {dim}] = {} values", y.len());
+    println!("  all finite        : {finite}");
+    println!("  output RMS        : {rms:.4}");
+    println!("\n  Ops exercised: rmsnorm, matmul (Q/K/V/O/up/down), RoPE,");
+    println!("  grouped-query causal attention, residual add.");
+    println!("  All layers ran with zero `unsafe` above the kernel boundary.");
 }
 
 /// Microbenchmark the decode-path matmul: a `[1 x k] * [n_rows x k]` projection,

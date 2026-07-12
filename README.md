@@ -31,15 +31,15 @@ boundary marked `#![forbid(unsafe_code)]`:
 | Crate | Mirrors | What it shows |
 |-------|---------|---------------|
 | [`prana-tensor`](crates/prana-tensor) | `BufferDesc` / `BufferPool` | dtype-erased tensors + size-bucketed buffer pool, zero `unsafe` |
-| [`prana-kernels`](crates/prana-kernels) | `matmul` / `quants` / `norms_rope` / `threading` | Q8 quantized matmul, dense matmul, RMSNorm, softmax, scoped-thread `parallel_for` |
+| [`prana-kernels`](crates/prana-kernels) | `matmul` / `quants` / `norms_rope` / `attention` / `threading` | Q8 quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, scoped-thread `parallel_for` |
 | [`prana-graph`](crates/prana-graph) | `CactusGraph` | checked-handle, shape-validating, define-then-run graph |
-| [`prana-cli`](crates/prana-cli) | `cactus run` / `benchmark` | end-to-end demo + decode-path microbenchmark |
+| [`prana-cli`](crates/prana-cli) | `cactus run` / `benchmark` | full-transformer-block demo + decode-path microbenchmark |
 
 ### Run it
 
 ```bash
-cargo test                                   # 17 tests
-cargo run --release -p prana-cli -- demo     # run one transformer-style block
+cargo test                                   # 23 tests
+cargo run --release -p prana-cli -- demo     # run one full transformer block (GQA, seq=8)
 cargo run --release -p prana-cli -- bench    # microbenchmark the Q8 matmul
 ```
 
@@ -61,12 +61,14 @@ once the target-gated NEON/AVX kernel tier lands. See EVALUATION.md §5.
 
 ## Status & scope
 
-This is a prototype to support an architectural decision. It implements a small
-op set (matmul, quantized matmul, RMSNorm, add, softmax) — enough to run one
-transformer block and prove the tensor → kernels → graph layering composes and
-computes correctly. It does **not** load real model weights, target ARM/Metal,
-or implement the CQ rotation-codebook quantization; those are scoped in the
-migration plan, not built here.
+This is a prototype to support an architectural decision. It implements a
+focused op set (matmul, quantized matmul, RMSNorm, add, softmax, RoPE, and
+causal grouped-query attention) — enough to run a **complete transformer block**
+(attention sub-layer + MLP sub-layer, with GQA and causal masking) and prove the
+tensor → kernels → graph layering composes and computes correctly. It does
+**not** load real model weights, target ARM/Metal, or implement the CQ
+rotation-codebook quantization; those are scoped in the migration plan, not built
+here.
 
 ## License
 

@@ -14,7 +14,7 @@
 //! enough to run one transformer block's worth of ops end-to-end and prove the
 //! layering, not a full op set.
 
-use prana_kernels::{matmul_f32, matmul_q8_f32, rmsnorm, softmax, QuantMatrix};
+use prana_kernels::{attention, matmul_f32, matmul_q8_f32, rmsnorm, rope, softmax, QuantMatrix};
 use prana_tensor::Tensor;
 
 /// Opaque handle to a graph node. Just a checked index — cannot be forged into
@@ -35,6 +35,10 @@ enum Op {
     Add { a: NodeId, b: NodeId },
     /// Row-wise softmax (single row expected in the prototype).
     Softmax { x: NodeId },
+    /// In-place rotary position embedding over `[seq, n_heads * head_dim]`.
+    Rope { x: NodeId, n_heads: usize, head_dim: usize, theta_base: f32 },
+    /// Causal (grouped-query) self-attention over Q/K/V nodes.
+    Attention { q: NodeId, k: NodeId, v: NodeId, n_heads: usize, n_kv_heads: usize, head_dim: usize },
 }
 
 struct Node {
@@ -95,6 +99,26 @@ impl Graph {
 
     pub fn softmax(&mut self, x: NodeId) -> NodeId {
         self.push(Op::Softmax { x })
+    }
+
+    /// Apply RoPE to a `[seq, n_heads * head_dim]` node (positions are the row
+    /// indices of the current forward pass).
+    pub fn rope(&mut self, x: NodeId, n_heads: usize, head_dim: usize, theta_base: f32) -> NodeId {
+        self.push(Op::Rope { x, n_heads, head_dim, theta_base })
+    }
+
+    /// Causal self-attention. `q` is `[seq, n_heads*head_dim]`, `k`/`v` are
+    /// `[seq, n_kv_heads*head_dim]`; `n_heads` must be a multiple of `n_kv_heads`.
+    pub fn attention(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> NodeId {
+        self.push(Op::Attention { q, k, v, n_heads, n_kv_heads, head_dim })
     }
 
     /// Bind a concrete tensor to an input node.
@@ -164,6 +188,28 @@ impl Graph {
                 let out = softmax(&a);
                 Ok(Tensor::from_f32(vec![a.len()], &out))
             }
+            Op::Rope { x, n_heads, head_dim, theta_base } => {
+                let mut a = self.f32_of(*x)?;
+                if a.len() != self.n_tokens * n_heads * head_dim {
+                    return Err(GraphError::ShapeMismatch { what: "rope input" });
+                }
+                rope(&mut a, self.n_tokens, *n_heads, *head_dim, *theta_base);
+                Ok(Tensor::from_f32(vec![self.n_tokens, n_heads * head_dim], &a))
+            }
+            Op::Attention { q, k, v, n_heads, n_kv_heads, head_dim } => {
+                let qv = self.f32_of(*q)?;
+                let kv = self.f32_of(*k)?;
+                let vv = self.f32_of(*v)?;
+                let seq = self.n_tokens;
+                if qv.len() != seq * n_heads * head_dim
+                    || kv.len() != seq * n_kv_heads * head_dim
+                    || vv.len() != seq * n_kv_heads * head_dim
+                {
+                    return Err(GraphError::ShapeMismatch { what: "attention qkv" });
+                }
+                let out = attention(&qv, &kv, &vv, seq, *n_heads, *n_kv_heads, *head_dim);
+                Ok(Tensor::from_f32(vec![seq, n_heads * head_dim], &out))
+            }
         }
     }
 
@@ -213,6 +259,38 @@ mod tests {
         g.set_input(x, Tensor::from_f32(vec![1, dim], &vec![0.25f32; dim]));
         g.execute().unwrap();
         assert_eq!(g.output_f32(y).unwrap().len(), dim);
+    }
+
+    #[test]
+    fn runs_an_attention_block() {
+        // seq=4, 2 heads, head_dim=8 -> feature width 16. q/k/v come from three
+        // projections of the same input; rope on q and k; then causal attention.
+        let seq = 4;
+        let n_heads = 2;
+        let head_dim = 8;
+        let width = n_heads * head_dim;
+
+        let mut g = Graph::new();
+        let x = g.input(seq);
+
+        let proj = |seed: f32| -> Vec<f32> {
+            (0..width * width).map(|i| (i as f32 * seed).sin()).collect()
+        };
+        let q0 = g.matmul_f32(x, proj(0.001), width, width);
+        let k0 = g.matmul_f32(x, proj(0.002), width, width);
+        let v0 = g.matmul_f32(x, proj(0.003), width, width);
+        let q = g.rope(q0, n_heads, head_dim, 10000.0);
+        let k = g.rope(k0, n_heads, head_dim, 10000.0);
+        let attn = g.attention(q, k, v0, n_heads, n_heads, head_dim);
+        let out = g.add(attn, x); // residual
+
+        let input: Vec<f32> = (0..seq * width).map(|i| (i as f32 * 0.02).cos()).collect();
+        g.set_input(x, Tensor::from_f32(vec![seq, width], &input));
+        g.execute().unwrap();
+
+        let y = g.output_f32(out).unwrap();
+        assert_eq!(y.len(), seq * width);
+        assert!(y.iter().all(|v| v.is_finite()));
     }
 
     #[test]
