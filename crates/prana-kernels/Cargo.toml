@@ -1,0 +1,9 @@
+[package]
+name = "prana-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SIMD-friendly compute kernels for Prana (matmul, quant, norms, softmax)"
+
+[dependencies]
+prana-tensor.workspace = true

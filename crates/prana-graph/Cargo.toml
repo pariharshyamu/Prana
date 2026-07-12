@@ -1,0 +1,13 @@
+[package]
+name = "prana-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A small define-then-run computation graph for Prana"
+
+[dependencies]
+prana-tensor.workspace = true
+prana-kernels.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

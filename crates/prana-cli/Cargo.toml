@@ -1,0 +1,18 @@
+[package]
+name = "prana-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Demo + microbenchmark driver for the Prana prototype"
+
+[[bin]]
+name = "prana"
+path = "src/main.rs"
+
+[dependencies]
+prana-tensor.workspace = true
+prana-kernels.workspace = true
+prana-graph.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

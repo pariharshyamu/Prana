@@ -1,0 +1,9 @@
+[package]
+name = "prana-tensor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tensor, dtype, and pooled-buffer primitives for Prana"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/prana-tensor",
+    "crates/prana-kernels",
+    "crates/prana-graph",
+    "crates/prana-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/pariharshyamu/prana"
+description = "Prana: a Rust edge-AI inference engine (feasibility prototype, inspired by Cactus)"
+
+[workspace.dependencies]
+prana-tensor = { path = "crates/prana-tensor" }
+prana-kernels = { path = "crates/prana-kernels" }
+prana-graph = { path = "crates/prana-graph" }
+
+# Release profile tuned for numeric kernels: single codegen unit + fat LTO so
+# the autovectorizer and inliner can see across crate boundaries.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
