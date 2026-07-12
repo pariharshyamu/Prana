@@ -42,6 +42,75 @@ pub fn rope(x: &mut [f32], seq: usize, n_heads: usize, head_dim: usize, theta_ba
     }
 }
 
+/// Apply interleaved (adjacent-pair) RoPE in place to a single position's
+/// activation row `[n_heads * head_dim]`, rotating pairs `(x[i], x[i+1])` —
+/// the llama2.c / original-Llama convention, as opposed to [`rope`]'s
+/// `rotate_half` pairing. Checkpoints trained with one convention are wrong
+/// under the other, so both exist.
+///
+/// `pos` is the absolute token position; frequency depends on `i % head_dim`
+/// so every head sees the same rotation schedule.
+pub fn rope_interleaved(x: &mut [f32], pos: usize, head_dim: usize, theta_base: f32) {
+    assert_eq!(head_dim % 2, 0, "head_dim must be even for RoPE");
+    assert_eq!(x.len() % head_dim, 0, "row must be a whole number of heads");
+    for i in (0..x.len()).step_by(2) {
+        let j = i % head_dim;
+        let freq = theta_base.powf(-(j as f32) / head_dim as f32);
+        let (sin, cos) = (pos as f32 * freq).sin_cos();
+        let (x0, x1) = (x[i], x[i + 1]);
+        x[i] = x0 * cos - x1 * sin;
+        x[i + 1] = x0 * sin + x1 * cos;
+    }
+}
+
+/// One decode step of causal (grouped-query) attention against a KV cache.
+///
+/// `q` is this position's query row `[n_heads * head_dim]`; `k_cache`/`v_cache`
+/// are `[capacity, n_kv_heads * head_dim]` row-major with rows `0..=pos`
+/// already filled (including this position's K/V). Returns the attention
+/// output `[n_heads * head_dim]` — softmax(q·K/√d)·V over positions `0..=pos`.
+pub fn attention_decode(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    assert_eq!(q.len(), n_heads * head_dim);
+    assert!(n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads));
+    let kv_stride = n_kv_heads * head_dim;
+    assert!(k_cache.len() >= (pos + 1) * kv_stride, "k_cache not filled to pos");
+    assert!(v_cache.len() >= (pos + 1) * kv_stride, "v_cache not filled to pos");
+
+    let group = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0f32; n_heads * head_dim];
+
+    for h in 0..n_heads {
+        let kv_h = h / group;
+        let q_vec = &q[h * head_dim..(h + 1) * head_dim];
+
+        let mut scores = vec![0f32; pos + 1];
+        for (t, s) in scores.iter_mut().enumerate() {
+            let k_vec = &k_cache[t * kv_stride + kv_h * head_dim..t * kv_stride + (kv_h + 1) * head_dim];
+            let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
+            *s = dot * scale;
+        }
+        let probs = softmax(&scores);
+
+        let dst = &mut out[h * head_dim..(h + 1) * head_dim];
+        for (t, &p) in probs.iter().enumerate() {
+            let v_vec = &v_cache[t * kv_stride + kv_h * head_dim..t * kv_stride + (kv_h + 1) * head_dim];
+            for (d, &vv) in dst.iter_mut().zip(v_vec) {
+                *d += p * vv;
+            }
+        }
+    }
+    out
+}
+
 /// Causal scaled-dot-product self-attention.
 ///
 /// `q`  is `[seq, n_heads * head_dim]`,
@@ -183,6 +252,43 @@ mod tests {
             for d in 0..head_dim {
                 let o = out[i * head_dim + d];
                 assert!(o >= vmin - 1e-5 && o <= vmax + 1e-5, "out {o} not in [{vmin},{vmax}]");
+            }
+        }
+    }
+
+    #[test]
+    fn rope_interleaved_preserves_pair_norm_and_pos0_identity() {
+        let head_dim = 8;
+        let mut x: Vec<f32> = (0..2 * head_dim).map(|i| (i as f32 * 0.3).sin() + 0.1).collect();
+        let before = x.clone();
+        rope_interleaved(&mut x, 0, head_dim, 10000.0);
+        assert_eq!(x, before, "position 0 must be identity");
+
+        rope_interleaved(&mut x, 7, head_dim, 10000.0);
+        for i in (0..x.len()).step_by(2) {
+            let n0 = before[i].powi(2) + before[i + 1].powi(2);
+            let n1 = x[i].powi(2) + x[i + 1].powi(2);
+            assert!((n0 - n1).abs() < 1e-4, "pair norm changed at {i}: {n0} vs {n1}");
+        }
+    }
+
+    #[test]
+    fn decode_with_cache_matches_full_attention() {
+        // Filling a KV cache position-by-position and querying the last position
+        // must reproduce the last row of the batch (prefill) attention.
+        let seq = 5;
+        let n_heads = 2;
+        let head_dim = 4;
+        let w = n_heads * head_dim;
+        let q: Vec<f32> = (0..seq * w).map(|i| (i as f32 * 0.07).sin()).collect();
+        let k: Vec<f32> = (0..seq * w).map(|i| (i as f32 * 0.05).cos()).collect();
+        let v: Vec<f32> = (0..seq * w).map(|i| (i as f32 * 0.03).sin()).collect();
+
+        let full = attention(&q, &k, &v, seq, n_heads, n_heads, head_dim);
+        for pos in 0..seq {
+            let step = attention_decode(&q[pos * w..(pos + 1) * w], &k, &v, pos, n_heads, n_heads, head_dim);
+            for (a, b) in full[pos * w..(pos + 1) * w].iter().zip(&step) {
+                assert!((a - b).abs() < 1e-5, "pos {pos}: {a} vs {b}");
             }
         }
     }

@@ -22,6 +22,14 @@ pub fn rmsnorm(x: &[f32], weight: &[f32], rows: usize, dim: usize, eps: f32) -> 
     out
 }
 
+/// SiLU (swish) activation in place: `x = x * sigmoid(x)` — the gate
+/// nonlinearity in Llama-family SwiGLU MLPs.
+pub fn silu(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v *= 1.0 / (1.0 + (-*v).exp());
+    }
+}
+
 /// Numerically stable softmax over a single vector (subtract max before exp).
 pub fn softmax(logits: &[f32]) -> Vec<f32> {
     if logits.is_empty() {
@@ -59,6 +67,16 @@ mod tests {
         assert!((s - 1.0).abs() < 1e-6);
         // Monotonic: larger logit -> larger prob.
         assert!(p[0] < p[1] && p[1] < p[2]);
+    }
+
+    #[test]
+    fn silu_matches_definition() {
+        let mut x = vec![0.0f32, 1.0, -1.0, 4.0];
+        silu(&mut x);
+        assert_eq!(x[0], 0.0);
+        assert!((x[1] - 0.731_058_6).abs() < 1e-5); // 1*sigmoid(1)
+        assert!((x[2] + 0.268_941_4).abs() < 1e-5); // -1*sigmoid(-1)
+        assert!(x[3] > 3.9 && x[3] < 4.0); // large x -> ~identity
     }
 
     #[test]

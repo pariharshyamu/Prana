@@ -5,6 +5,9 @@
 //!                 and report throughput plus the memory saved by quantization.
 //! `prana chat`  — drive the Phase 0 safe wrapper over the Cactus C ABI
 //!                 (mock engine by default; real engine with `link-cactus`).
+//! `prana run`   — generate text with a real model (llama2.c checkpoint
+//!                 format, e.g. Karpathy's TinyStories models) running
+//!                 entirely on Prana's safe Rust kernels.
 //!
 //! This is not the Cactus engine; it is a proof that Prana's safe-Rust layering
 //! (tensor -> kernels -> graph) composes into something that actually computes,
@@ -22,11 +25,84 @@ fn main() {
         "demo" => demo(),
         "bench" => bench(),
         "chat" => chat(),
+        "run" => run(),
         other => {
-            eprintln!("unknown command '{other}'. use: prana [demo|bench|chat]");
+            eprintln!("unknown command '{other}'. use: prana [demo|bench|chat|run]");
             std::process::exit(2);
         }
     }
+}
+
+/// Generate text with a real model. Usage:
+/// `prana run [model.bin] [tokenizer.bin] [prompt] [--steps N] [--temp T] [--q8]`
+fn run() {
+    use prana_model::{checkpoint, Precision, Sampler, Tokenizer};
+    use std::io::Write;
+
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let mut positional = Vec::new();
+    let mut steps = 200usize;
+    let mut temp = 0.8f32;
+    let mut seed = 20260712u64;
+    let mut precision = Precision::F32;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--steps" => steps = it.next().and_then(|v| v.parse().ok()).unwrap_or(steps),
+            "--temp" => temp = it.next().and_then(|v| v.parse().ok()).unwrap_or(temp),
+            "--seed" => seed = it.next().and_then(|v| v.parse().ok()).unwrap_or(seed),
+            "--q8" => precision = Precision::Q8,
+            v => positional.push(v.to_string()),
+        }
+    }
+    let model_path = positional.first().cloned().unwrap_or_else(|| "models/stories15M.bin".into());
+    let tok_path = positional.get(1).cloned().unwrap_or_else(|| "models/tokenizer.bin".into());
+    let prompt = positional.get(2).cloned().unwrap_or_else(|| "Once upon a time".into());
+
+    println!("== Prana run: real-model inference on safe Rust kernels ==\n");
+    let t_load = std::time::Instant::now();
+    let model = match checkpoint::load(std::path::Path::new(&model_path), precision) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("cannot load '{model_path}': {e}");
+            eprintln!("hint: fetch the model first — see scripts/fetch-model.sh");
+            std::process::exit(1);
+        }
+    };
+    let tokenizer = Tokenizer::load(std::path::Path::new(&tok_path), model.config.vocab_size)
+        .unwrap_or_else(|e| {
+            eprintln!("cannot load tokenizer '{tok_path}': {e}");
+            std::process::exit(1);
+        });
+
+    let c = &model.config;
+    println!(
+        "  model             : {model_path}  (dim={} layers={} heads={} kv_heads={} vocab={} ctx={})",
+        c.dim, c.n_layers, c.n_heads, c.n_kv_heads, c.vocab_size, c.seq_len
+    );
+    println!(
+        "  precision         : {:?}  ({:.1} MiB of projection weights)",
+        precision,
+        model.projection_bytes() as f64 / (1024.0 * 1024.0)
+    );
+    println!("  load time         : {:.2}s", t_load.elapsed().as_secs_f64());
+    println!("  sampler           : temp={temp} seed={seed}   steps={steps}\n");
+    println!("---");
+
+    // The stream includes the prompt's own pieces as they are prefilled.
+    let mut sampler = Sampler::new(temp, seed);
+    let stats = prana_model::generate(&model, &tokenizer, &prompt, steps, &mut sampler, |piece| {
+        std::io::stdout().write_all(piece).ok();
+        std::io::stdout().flush().ok();
+    });
+    println!("\n---\n");
+    println!(
+        "  {} prompt + {} generated tokens in {:.2}s  ->  {:.1} tok/s",
+        stats.prompt_tokens,
+        stats.generated_tokens,
+        stats.seconds,
+        (stats.prompt_tokens + stats.generated_tokens) as f64 / stats.seconds
+    );
 }
 
 /// Drive the Phase 0 wrapper end-to-end: open a model handle over the C ABI,

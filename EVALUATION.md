@@ -166,14 +166,17 @@ concretely shows Phases 1–3 are feasible and what the layering looks like:
 | `prana-kernels` | `matmul.cpp`, `quants.cpp`, `norms_rope.cpp`, `threading.h` | Q8 block-quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, and a `thread::scope` `parallel_for`; scalar autovectorized *default* tier with a documented seam for a NEON/AVX `unsafe` tier |
 | `prana-graph` | `CactusGraph` (`builder.cpp`, `execute.cpp`) | define-then-run graph where node handles are checked indices, ops validate shapes, and an unbound input yields a typed `Result` error instead of UB |
 | `prana-cactus` | `bindings/rust/cactus.rs` + `cactus_engine.h` | **Phase 0, working**: the full C ABI transcribed into a `sys` module, wrapped by a safe API — RAII `Model` (destroy-on-drop, panic-safe), `Result` errors carrying `cactus_get_last_error`, a streaming-callback trampoline that contains panics at the FFI boundary, and grow-and-retry handling for the header's fixed-buffer/out-param patterns. Tested against an in-process Rust mock of the same symbols (the real static lib is ARM/Metal-only); `--features link-cactus` binds the real engine through identical declarations |
-| `prana-cli` | `cactus run` / `cactus benchmark` | runs a **complete transformer block** (norm → QKV → RoPE → causal GQA attention → residual → MLP) end-to-end, microbenchmarks the decode-path matmul, and drives the Phase 0 wrapper (`chat`) |
+| `prana-model` | engine-side model loading, tokenizer, sampling | **runs a real trained model.** Loads llama2.c checkpoints (stories15M: dim 288, 6 layers, 32k vocab), Llama SentencePiece BPE tokenizer, KV-cached forward pass composed from the kernels above, greedy + seeded-temperature sampling. Greedy output matches llama2.c's reference generation for the same checkpoint — validating tokenizer, interleaved RoPE, causal attention, and SwiGLU numerics against an independent implementation. ~150 tok/s on x86 scalar kernels, f32 or Q8-at-load. Zero `unsafe`, zero dependencies |
+| `prana-cli` | `cactus run` / `cactus benchmark` | generates stories from the real model (`run`), runs a **complete transformer block** demo, microbenchmarks the decode-path matmul, and drives the Phase 0 wrapper (`chat`) |
 
 Everything above the kernel boundary is `#![forbid(unsafe_code)]`; the Phase 0
 crate concentrates the workspace's entire `unsafe` FFI surface into one
 auditable module pair (`sys` + the commented blocks in its wrapper). Run it:
 
 ```bash
-cargo test              # 35 tests across the workspace
+cargo test                # 48 tests across the workspace
+./scripts/fetch-model.sh  # stories15M weights + tokenizer
+cargo run --release -p prana-cli -- run   # real-model story generation
 cargo run --release -p prana-cli -- demo
 cargo run --release -p prana-cli -- bench
 cargo run --release -p prana-cli -- chat

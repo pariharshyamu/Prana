@@ -1,0 +1,12 @@
+[package]
+name = "prana-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Llama-family model loading, tokenization, and text generation for Prana"
+
+[dependencies]
+prana-kernels.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

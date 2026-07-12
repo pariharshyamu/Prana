@@ -5,6 +5,7 @@ members = [
     "crates/prana-kernels",
     "crates/prana-graph",
     "crates/prana-cactus",
+    "crates/prana-model",
     "crates/prana-cli",
 ]
 
@@ -20,6 +21,7 @@ prana-tensor = { path = "crates/prana-tensor" }
 prana-kernels = { path = "crates/prana-kernels" }
 prana-graph = { path = "crates/prana-graph" }
 prana-cactus = { path = "crates/prana-cactus" }
+prana-model = { path = "crates/prana-model" }
 
 # Release profile tuned for numeric kernels: single codegen unit + fat LTO so
 # the autovectorizer and inliner can see across crate boundaries.

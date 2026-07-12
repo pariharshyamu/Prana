@@ -126,6 +126,20 @@ where
 {
     let threads = default_threads();
 
+    // Below this many MACs, thread spawn cost exceeds the work itself — run
+    // inline. A small model's per-layer projections (e.g. 288x288) land here;
+    // big projections and the LM head still fan out.
+    const MIN_MACS_FOR_THREADS: usize = 256 * 1024;
+    if n_tokens * k * n_rows < MIN_MACS_FOR_THREADS || threads == 1 {
+        for t in 0..n_tokens {
+            let a_row = &a[t * k..(t + 1) * k];
+            for r in 0..n_rows {
+                out[t * n_rows + r] = dot(a_row, r);
+            }
+        }
+        return;
+    }
+
     if n_tokens == 1 {
         let a_row = &a[0..k];
         let row_chunk = n_rows.div_ceil(threads).max(1);
