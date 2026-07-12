@@ -4,6 +4,7 @@ members = [
     "crates/prana-tensor",
     "crates/prana-kernels",
     "crates/prana-graph",
+    "crates/prana-cactus",
     "crates/prana-cli",
 ]
 
@@ -18,6 +19,7 @@ description = "Prana: a Rust edge-AI inference engine (feasibility prototype, in
 prana-tensor = { path = "crates/prana-tensor" }
 prana-kernels = { path = "crates/prana-kernels" }
 prana-graph = { path = "crates/prana-graph" }
+prana-cactus = { path = "crates/prana-cactus" }
 
 # Release profile tuned for numeric kernels: single codegen unit + fat LTO so
 # the autovectorizer and inliner can see across crate boundaries.

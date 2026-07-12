@@ -139,6 +139,7 @@ The right path exploits the fact that **Cactus already exposes a C ABI**:
 ```
 Phase 0  Rust CLI + server wrapping the existing libcactus_engine.a via FFI.
          (The raw bindings already exist; make them a safe, idiomatic crate.)
+         --> demonstrated by `crates/prana-cactus` in this repo.
 Phase 1  Reimplement the engine's orchestration in Rust — request handling,
          streaming, sampling, tokenizer, tool-call/grammar parsing, RAG,
          vector index — still calling C++ graph+kernels underneath.
@@ -164,14 +165,18 @@ concretely shows Phases 1–3 are feasible and what the layering looks like:
 | `prana-tensor` | `BufferDesc`, `BufferPool` (`core.cpp`) | dtype-erased tensors + a size-bucketed buffer pool with **zero `unsafe`** (`#![forbid(unsafe_code)]`) — the manual pointer-nulling move-ctor becomes compiler-tracked ownership |
 | `prana-kernels` | `matmul.cpp`, `quants.cpp`, `norms_rope.cpp`, `threading.h` | Q8 block-quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, and a `thread::scope` `parallel_for`; scalar autovectorized *default* tier with a documented seam for a NEON/AVX `unsafe` tier |
 | `prana-graph` | `CactusGraph` (`builder.cpp`, `execute.cpp`) | define-then-run graph where node handles are checked indices, ops validate shapes, and an unbound input yields a typed `Result` error instead of UB |
-| `prana-cli` | `cactus run` / `cactus benchmark` | runs a **complete transformer block** (norm → QKV → RoPE → causal GQA attention → residual → MLP) end-to-end and microbenchmarks the decode-path matmul |
+| `prana-cactus` | `bindings/rust/cactus.rs` + `cactus_engine.h` | **Phase 0, working**: the full C ABI transcribed into a `sys` module, wrapped by a safe API — RAII `Model` (destroy-on-drop, panic-safe), `Result` errors carrying `cactus_get_last_error`, a streaming-callback trampoline that contains panics at the FFI boundary, and grow-and-retry handling for the header's fixed-buffer/out-param patterns. Tested against an in-process Rust mock of the same symbols (the real static lib is ARM/Metal-only); `--features link-cactus` binds the real engine through identical declarations |
+| `prana-cli` | `cactus run` / `cactus benchmark` | runs a **complete transformer block** (norm → QKV → RoPE → causal GQA attention → residual → MLP) end-to-end, microbenchmarks the decode-path matmul, and drives the Phase 0 wrapper (`chat`) |
 
-Everything above the kernel boundary is `#![forbid(unsafe_code)]`. Run it:
+Everything above the kernel boundary is `#![forbid(unsafe_code)]`; the Phase 0
+crate concentrates the workspace's entire `unsafe` FFI surface into one
+auditable module pair (`sys` + the commented blocks in its wrapper). Run it:
 
 ```bash
-cargo test              # 23 tests across the workspace
+cargo test              # 35 tests across the workspace
 cargo run --release -p prana-cli -- demo
 cargo run --release -p prana-cli -- bench
+cargo run --release -p prana-cli -- chat
 ```
 
 ### What the benchmark honestly shows

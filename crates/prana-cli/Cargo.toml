@@ -13,6 +13,7 @@ path = "src/main.rs"
 prana-tensor.workspace = true
 prana-kernels.workspace = true
 prana-graph.workspace = true
+prana-cactus.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

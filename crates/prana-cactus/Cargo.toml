@@ -1,0 +1,18 @@
+[package]
+name = "prana-cactus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase 0: safe idiomatic Rust wrapper over the Cactus engine C ABI"
+
+[features]
+# Link the real `libcactus_engine.a` instead of the built-in Rust mock engine.
+# Requires CACTUS_LIB_DIR to point at the directory containing the static lib
+# (see build.rs). Without this feature the crate compiles and tests everywhere
+# against a faithful in-process mock of the same C ABI.
+link-cactus = []
+
+[lints.rust]
+# `unsafe` is the point of this crate — but every unsafe operation inside an
+# unsafe fn must still be explicitly scoped and justified.
+unsafe_op_in_unsafe_fn = "deny"

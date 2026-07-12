@@ -3,6 +3,8 @@
 //! `prana demo`  — run a tiny transformer-style block through the graph.
 //! `prana bench` — microbenchmark the Q8 matmul kernel (the decode hot path)
 //!                 and report throughput plus the memory saved by quantization.
+//! `prana chat`  — drive the Phase 0 safe wrapper over the Cactus C ABI
+//!                 (mock engine by default; real engine with `link-cactus`).
 //!
 //! This is not the Cactus engine; it is a proof that Prana's safe-Rust layering
 //! (tensor -> kernels -> graph) composes into something that actually computes,
@@ -19,11 +21,61 @@ fn main() {
     match mode.as_str() {
         "demo" => demo(),
         "bench" => bench(),
+        "chat" => chat(),
         other => {
-            eprintln!("unknown command '{other}'. use: prana [demo|bench]");
+            eprintln!("unknown command '{other}'. use: prana [demo|bench|chat]");
             std::process::exit(2);
         }
     }
+}
+
+/// Drive the Phase 0 wrapper end-to-end: open a model handle over the C ABI,
+/// stream a completion token by token, tokenize, and embed — all through the
+/// safe API. With the default build this talks to the in-process mock engine;
+/// built with `--features prana-cactus/link-cactus` it talks to the real
+/// `libcactus_engine.a` through the identical code path.
+fn chat() {
+    use prana_cactus::{CompleteOptions, Message, Model};
+    use std::io::Write;
+
+    println!("== Prana chat: Phase 0 safe wrapper over the Cactus C ABI ==\n");
+    println!("  engine            : {}", prana_cactus::engine_kind());
+
+    let model_path = std::env::args().nth(2).unwrap_or_else(|| "mock://tiny-model".to_string());
+    let prompt = std::env::args().nth(3).unwrap_or_else(|| "ping".to_string());
+
+    let mut model = match Model::open(&model_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("  failed to open '{model_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("  model             : {model_path}");
+    println!("  prompt            : {prompt}\n");
+
+    print!("  streamed reply    : ");
+    std::io::stdout().flush().ok();
+    let mut n_tokens = 0u32;
+    let reply = model
+        .complete_streaming(
+            &[Message::system("You are Prana."), Message::user(&prompt)],
+            &CompleteOptions::default(),
+            |tok, _id| {
+                print!("{tok}");
+                std::io::stdout().flush().ok();
+                n_tokens += 1;
+            },
+        )
+        .expect("completion");
+    println!("\n  tokens streamed   : {n_tokens}");
+    println!("  full response     : {reply}");
+
+    let tokens = model.tokenize(&prompt).expect("tokenize");
+    println!("  tokenize(prompt)  : {} tokens", tokens.len());
+    let embedding = model.embed(&prompt, true).expect("embed");
+    println!("  embed(prompt)     : {}-dim vector", embedding.len());
+    println!("\n  Model handle is RAII — cactus_destroy runs on drop, even on panic.");
 }
 
 /// Run one full transformer block — attention sub-layer (norm -> QKV -> RoPE ->

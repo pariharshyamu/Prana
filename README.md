@@ -33,14 +33,24 @@ boundary marked `#![forbid(unsafe_code)]`:
 | [`prana-tensor`](crates/prana-tensor) | `BufferDesc` / `BufferPool` | dtype-erased tensors + size-bucketed buffer pool, zero `unsafe` |
 | [`prana-kernels`](crates/prana-kernels) | `matmul` / `quants` / `norms_rope` / `attention` / `threading` | Q8 quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, scoped-thread `parallel_for` |
 | [`prana-graph`](crates/prana-graph) | `CactusGraph` | checked-handle, shape-validating, define-then-run graph |
-| [`prana-cli`](crates/prana-cli) | `cactus run` / `benchmark` | full-transformer-block demo + decode-path microbenchmark |
+| [`prana-cactus`](crates/prana-cactus) | `bindings/rust/cactus.rs` + `cactus_engine.h` | **Phase 0**: safe RAII wrapper over the real Cactus C ABI — `Result` errors, streaming-callback trampoline with panic containment, grow-and-retry buffers; testable everywhere via an in-process mock of the ABI |
+| [`prana-cli`](crates/prana-cli) | `cactus run` / `benchmark` / `chat` | full-transformer-block demo, decode-path microbenchmark, Phase 0 chat driver |
 
 ### Run it
 
 ```bash
-cargo test                                   # 23 tests
+cargo test                                   # 35 tests
 cargo run --release -p prana-cli -- demo     # run one full transformer block (GQA, seq=8)
 cargo run --release -p prana-cli -- bench    # microbenchmark the Q8 matmul
+cargo run --release -p prana-cli -- chat     # drive the Phase 0 safe wrapper (mock engine)
+```
+
+To bind `prana-cactus` against the real engine instead of the mock, build
+`libcactus_engine.a` on an ARM/Apple host (`cactus-engine/build.sh` in the
+Cactus repo) and use:
+
+```bash
+CACTUS_LIB_DIR=/path/to/lib cargo build -p prana-cactus --features link-cactus
 ```
 
 Example:
@@ -65,10 +75,12 @@ This is a prototype to support an architectural decision. It implements a
 focused op set (matmul, quantized matmul, RMSNorm, add, softmax, RoPE, and
 causal grouped-query attention) — enough to run a **complete transformer block**
 (attention sub-layer + MLP sub-layer, with GQA and causal masking) and prove the
-tensor → kernels → graph layering composes and computes correctly. It does
-**not** load real model weights, target ARM/Metal, or implement the CQ
-rotation-codebook quantization; those are scoped in the migration plan, not built
-here.
+tensor → kernels → graph layering composes and computes correctly. It also
+implements **Phase 0 of the migration plan**: `prana-cactus`, a safe idiomatic
+wrapper over the engine's real C ABI, exercised against an in-process mock of
+that ABI (the native static lib is ARM/Metal-only). It does **not** load real
+model weights, target ARM/Metal, or implement the CQ rotation-codebook
+quantization; those are scoped in the migration plan, not built here.
 
 ## License
 
