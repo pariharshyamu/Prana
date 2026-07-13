@@ -26,10 +26,12 @@
 mod attention;
 mod matmul;
 mod norms;
+mod pool;
 mod simd_x86;
 mod threading;
 
 pub use attention::{attention, attention_decode, rope, rope_interleaved};
 pub use matmul::{dequantize_q8, matmul_f32, matmul_q8_f32, quantize_q8, QuantMatrix, Q8_BLOCK};
 pub use norms::{rmsnorm, silu, softmax};
+pub use pool::{global as pool, Pool};
 pub use threading::parallel_for;

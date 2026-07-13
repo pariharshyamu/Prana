@@ -166,7 +166,7 @@ concretely shows Phases 1–3 are feasible and what the layering looks like:
 | `prana-kernels` | `matmul.cpp`, `quants.cpp`, `norms_rope.cpp`, `threading.h` | Q8 block-quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, and a `thread::scope` `parallel_for`; scalar autovectorized *default* tier with a documented seam for a NEON/AVX `unsafe` tier |
 | `prana-graph` | `CactusGraph` (`builder.cpp`, `execute.cpp`) | define-then-run graph where node handles are checked indices, ops validate shapes, and an unbound input yields a typed `Result` error instead of UB |
 | `prana-cactus` | `bindings/rust/cactus.rs` + `cactus_engine.h` | **Phase 0, working**: the full C ABI transcribed into a `sys` module, wrapped by a safe API — RAII `Model` (destroy-on-drop, panic-safe), `Result` errors carrying `cactus_get_last_error`, a streaming-callback trampoline that contains panics at the FFI boundary, and grow-and-retry handling for the header's fixed-buffer/out-param patterns. Tested against an in-process Rust mock of the same symbols (the real static lib is ARM/Metal-only); `--features link-cactus` binds the real engine through identical declarations |
-| `prana-model` | engine-side model loading, tokenizer, sampling | **runs a real trained model.** Loads llama2.c checkpoints *and GGUF v2/v3* (F32/F16/Q8_0 tensors, llama metadata, embedded SentencePiece tokenizer — GGUF Q8_0 blocks map 1:1 onto `QuantMatrix` and run natively without requantization), KV-cached forward pass composed from the kernels above, greedy + seeded-temperature sampling. Greedy output is token-identical to llama2.c's reference generation for the same checkpoint, via both container formats — validating tokenizer, interleaved RoPE, causal attention, and SwiGLU numerics against an independent implementation. Zero `unsafe`, zero dependencies |
+| `prana-model` | engine-side model loading, tokenizer, sampling | **runs a real trained model.** Loads llama2.c checkpoints *and GGUF v2/v3* (F32/F16/Q8_0/**Q4_K/Q6_K** tensors — so Q4_K_M-mixture model files load; Q8_0 blocks map 1:1 onto `QuantMatrix` and run natively, K-quants dequantize at load with bit-level unit tests locking the unpacking to llama.cpp semantics), llama metadata, embedded SentencePiece tokenizer, KV-cached forward pass, greedy + seeded-temperature sampling. Greedy output is token-identical to llama2.c's reference generation via both container formats. Zero `unsafe`, zero dependencies |
 | `prana-cli` | `cactus run` / `cactus benchmark` | generates stories from the real model (`run`), runs a **complete transformer block** demo, microbenchmarks the decode-path matmul, and drives the Phase 0 wrapper (`chat`) |
 
 Everything above the kernel boundary is `#![forbid(unsafe_code)]`; the Phase 0
@@ -192,25 +192,38 @@ running the identical `stories15M` checkpoint with identical greedy decoding
 | implementation | tok/s |
 |---|---:|
 | llama2.c, `gcc -O3` (single thread) | 57 |
-| Prana f32, scalar tier only | 135 |
-| Prana Q8, scalar tier only | 166 |
-| **Prana f32 + AVX2/FMA SIMD tier** | **183** |
-| **Prana Q8 + AVX2/FMA SIMD tier** | **359–443** |
+| Prana f32, scalar tier, no pool | 135 |
+| Prana Q8, scalar tier, no pool | 166 |
+| Prana f32 + AVX2/FMA SIMD tier | 183 |
+| Prana Q8 + AVX2/FMA SIMD tier | 359 |
 | llama2.c, `gcc -Ofast -march=native -fopenmp` (4 threads) | 599 |
+| **Prana f32 + SIMD + persistent pool** | **516** |
+| **Prana Q8 + SIMD + persistent pool** | **1267** |
 
-Reading: safe scalar Rust beats the plain single-threaded C build ~2.4×
-(autovectorized kernels + threading the LM-head matmul). The Phase 3 SIMD tier
-(`simd_x86.rs`, ~100 lines of commented `unsafe` behind runtime feature
-detection) then adds +36% to f32 and **2.2×+ to Q8** — the scalar tier's
-`i8→f32` conversion was the quantized path's bottleneck, and with AVX2 the
-memory-footprint win finally becomes the expected *speed* win. Every SIMD
-kernel is parity-tested against its scalar twin, and greedy generation stays
-token-identical to llama2.c's reference output. The remaining gap to the
-maximally-flagged OpenMP build is thread-pool reuse (OpenMP parallelizes every
-per-layer matmul from a persistent pool; Prana's `thread::scope` spawn cost
-keeps small matmuls single-threaded) — the ThreadPool port already scoped in
-the plan. The conclusion of §2a stands empirically: Rust reaches C's
-performance techniques one-for-one.
+Reading, in the order the pieces landed:
+
+1. Safe scalar Rust beats the plain single-threaded C build ~2.4×
+   (autovectorized kernels + threading the LM-head matmul).
+2. The SIMD tier (`simd_x86.rs`, ~100 lines of commented `unsafe` behind
+   runtime feature detection) adds +36% to f32 and 2.2× to Q8 — the scalar
+   `i8→f32` conversion was the quantized path's bottleneck, and with AVX2 the
+   memory-footprint win becomes the expected *speed* win. Every SIMD kernel is
+   parity-tested against its scalar twin.
+3. The **persistent worker pool** (`pool.rs`: spin-then-park workers, epoch
+   job publication, work-stealing chunk counter) removes the per-call thread
+   spawn that had kept small per-layer matmuls single-threaded — another
+   ~2.8× on both paths. This was the exact asymmetry the earlier benchmark
+   identified vs OpenMP, and closing it puts **Prana Q8 at 2.1× the
+   throughput of the maximally-flagged OpenMP C build** (which has no
+   quantized path; Prana f32 vs C f32 is 516 vs 599 with the remaining gap
+   being `-Ofast` fast-math).
+
+Throughout, greedy generation stays token-identical to llama2.c's reference
+output. The workspace's `unsafe` remains confined to two audited kernel-crate
+modules (`simd_x86.rs`, `pool.rs`) plus the Phase 0 FFI crate — everything
+above stays `#![forbid(unsafe_code)]`. The conclusion of §2a is now
+demonstrated rather than argued: Rust reaches C's performance techniques
+one-for-one, and the safe orchestration above them costs nothing.
 
 ### What the benchmark honestly shows
 

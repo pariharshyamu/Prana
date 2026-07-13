@@ -10,8 +10,10 @@ backed by a compiling, tested Rust workspace that demonstrates the proposed
 architecture rather than just asserting it — up to and including **running a
 real trained LLM end-to-end**: it loads Karpathy's 15M-parameter TinyStories
 Llama from either **llama2.c or GGUF** containers and generates coherent
-stories at up to **~440 tok/s** (Q8 + the AVX2/FMA SIMD tier; ~180 tok/s f32),
-with greedy output token-identical to llama2.c's reference implementation.
+stories at up to **~1270 tok/s** (Q8 + AVX2/FMA SIMD + persistent worker
+pool; ~520 tok/s f32) — 2.1× the throughput of llama2.c's best OpenMP build
+on the same machine — with greedy output token-identical to llama2.c's
+reference implementation.
 
 ```text
 $ prana run
@@ -46,7 +48,7 @@ boundary marked `#![forbid(unsafe_code)]`:
 | [`prana-kernels`](crates/prana-kernels) | `matmul` / `quants` / `norms_rope` / `attention` / `threading` | Q8 quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, scoped-thread `parallel_for` |
 | [`prana-graph`](crates/prana-graph) | `CactusGraph` | checked-handle, shape-validating, define-then-run graph |
 | [`prana-cactus`](crates/prana-cactus) | `bindings/rust/cactus.rs` + `cactus_engine.h` | **Phase 0**: safe RAII wrapper over the real Cactus C ABI — `Result` errors, streaming-callback trampoline with panic containment, grow-and-retry buffers; testable everywhere via an in-process mock of the ABI |
-| [`prana-model`](crates/prana-model) | `cactus-engine` model loading / tokenizer / sampling | **real-model inference**: llama2.c *and GGUF* loaders (F32/F16/Q8_0; GGUF Q8_0 runs natively as `QuantMatrix`), Llama SentencePiece BPE tokenizer (file or GGUF-embedded), KV-cached forward pass, greedy/temperature sampling — zero `unsafe`, zero deps |
+| [`prana-model`](crates/prana-model) | `cactus-engine` model loading / tokenizer / sampling | **real-model inference**: llama2.c *and GGUF* loaders (F32/F16/Q8_0/Q4_K/Q6_K — Q4_K_M model files load; Q8_0 runs natively as `QuantMatrix`), Llama SentencePiece BPE tokenizer (file or GGUF-embedded), KV-cached forward pass, greedy/temperature sampling — zero `unsafe`, zero deps |
 | [`prana-cli`](crates/prana-cli) | `cactus run` / `benchmark` / `chat` | real-model text generation (`run`), transformer-block demo, microbenchmark, Phase 0 chat driver |
 
 ### Run it
@@ -63,6 +65,10 @@ cargo run --release -p prana-cli -- chat     # drive the Phase 0 safe wrapper (m
 # GGUF: convert the checkpoint, then run it (tokenizer is embedded in the file)
 python3 scripts/convert-to-gguf.py models/stories15M.bin models/tokenizer.bin models/stories15M.gguf
 cargo run --release -p prana-cli -- run models/stories15M.gguf "Once upon a time" --q8
+
+# K-quants: build a Q4_K/Q6_K mixture file (Q4_K_M-style) and run it
+python3 scripts/convert-to-gguf.py models/stories15M.bin models/tokenizer.bin models/stories15M-q4km.gguf q4km
+cargo run --release -p prana-cli -- run models/stories15M-q4km.gguf "Once upon a time"
 ```
 
 `prana run` options: `[model.bin tokenizer.bin | model.gguf] [prompt]
@@ -108,8 +114,9 @@ llama2.c's reference output token-for-token through both container formats.
 It also implements **Phase 0 of the migration plan**: `prana-cactus`, a safe
 idiomatic wrapper over the engine's real C ABI, exercised against an
 in-process mock of that ABI (the native static lib is ARM/Metal-only).
-Still out of scope: ARM NEON/Metal targets, a persistent worker pool, GGUF
-quant types beyond Q8_0 (Q4_K etc.), safetensors, and the CQ rotation-codebook
+Still out of scope: ARM NEON/Metal targets, native (no-dequant) K-quant
+matmul kernels, safetensors, non-llama architectures (Qwen2/Phi), BPE-merges
+tokenizers (SmolLM-style GPT-2 vocab), and the CQ rotation-codebook
 quantization; those are the migration plan's later phases, not built here.
 
 ## License

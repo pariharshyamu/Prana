@@ -28,6 +28,17 @@ const MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
 const GGML_F32: u32 = 0;
 const GGML_F16: u32 = 1;
 const GGML_Q8_0: u32 = 8;
+const GGML_Q4_K: u32 = 12;
+const GGML_Q6_K: u32 = 14;
+
+/// K-quant super-block size.
+const QK_K: usize = 256;
+/// Q4_K super-block: f16 d + f16 dmin + 12 bytes of 6-bit scales/mins + 128
+/// bytes of 4-bit quants.
+const Q4_K_BLOCK_BYTES: usize = 2 + 2 + 12 + QK_K / 2;
+/// Q6_K super-block: 128 bytes low nibbles + 64 bytes high bits + 16 i8
+/// scales + f16 d.
+const Q6_K_BLOCK_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
 
 fn err(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -151,6 +162,72 @@ pub fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// Unpack the 6-bit (scale, min) pair `j` (0..8) from a Q4_K super-block's
+/// 12-byte packed `scales` field — llama.cpp's `get_scale_min_k4`.
+fn q4k_scale_min(j: usize, s: &[u8]) -> (f32, f32) {
+    if j < 4 {
+        ((s[j] & 63) as f32, (s[j + 4] & 63) as f32)
+    } else {
+        (
+            ((s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4)) as f32,
+            ((s[j + 4] >> 4) | ((s[j] >> 6) << 4)) as f32,
+        )
+    }
+}
+
+/// Dequantize one Q4_K super-block (144 bytes -> 256 f32), llama.cpp
+/// `dequantize_row_q4_K`: eight 32-wide groups, each `d*sc*(q) - dmin*m`,
+/// where groups (2g, 2g+1) share 32 bytes as (low nibbles, high nibbles).
+fn dequant_q4k_block(b: &[u8], out: &mut Vec<f32>) {
+    let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+    let scales = &b[4..16];
+    let qs = &b[16..16 + QK_K / 2];
+    for pair in 0..4 {
+        let q = &qs[pair * 32..(pair + 1) * 32];
+        let (sc1, m1) = q4k_scale_min(pair * 2, scales);
+        let (sc2, m2) = q4k_scale_min(pair * 2 + 1, scales);
+        let (d1, min1) = (d * sc1, dmin * m1);
+        let (d2, min2) = (d * sc2, dmin * m2);
+        for &byte in q {
+            out.push(d1 * (byte & 0xF) as f32 - min1);
+        }
+        for &byte in q {
+            out.push(d2 * (byte >> 4) as f32 - min2);
+        }
+    }
+}
+
+/// Dequantize one Q6_K super-block (210 bytes -> 256 f32), llama.cpp
+/// `dequantize_row_q6_K`: 6-bit values assembled from a low nibble plus 2
+/// high bits, minus 32, times `d * scales[sub-block]`.
+fn dequant_q6k_block(b: &[u8], out: &mut Vec<f32>) {
+    let ql = &b[0..128];
+    let qh = &b[128..192];
+    let sc = &b[192..208];
+    let d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
+    let scale = |i: usize| d * sc[i] as i8 as f32;
+    let start = out.len();
+    out.resize(start + QK_K, 0.0);
+    let y = &mut out[start..start + QK_K];
+    // Each 128-value half decodes four interleaved 32-wide groups: value l of
+    // group g lands at y[half*128 + g*32 + l].
+    for half in 0..2 {
+        let (ql, qh, s0, yo) = (&ql[half * 64..], &qh[half * 32..], half * 8, half * 128);
+        for l in 0..32 {
+            let is = s0 + l / 16;
+            let q1 = (((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i8 - 32) as f32;
+            let q2 = (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32) as f32;
+            let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32) as f32;
+            let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32) as f32;
+            y[yo + l] = scale(is) * q1;
+            y[yo + l + 32] = scale(is + 2) * q2;
+            y[yo + l + 64] = scale(is + 4) * q3;
+            y[yo + l + 96] = scale(is + 6) * q4;
+        }
+    }
+}
+
 /// The parsed file: metadata + tensor directory + the raw data section.
 pub struct Gguf {
     pub metadata: HashMap<String, Value>,
@@ -239,6 +316,24 @@ impl Gguf {
                 for b in raw.chunks_exact(34) {
                     let scale = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
                     out.extend(b[2..].iter().map(|&q| q as i8 as f32 * scale));
+                }
+                Ok(out)
+            }
+            GGML_Q4_K | GGML_Q6_K => {
+                let ty = info.ggml_type;
+                if !n.is_multiple_of(QK_K) {
+                    return Err(err(format!("K-quant tensor '{name}' not {QK_K}-aligned")));
+                }
+                let blocks = n / QK_K;
+                let block_bytes = if ty == GGML_Q4_K { Q4_K_BLOCK_BYTES } else { Q6_K_BLOCK_BYTES };
+                let raw = self.raw(info, blocks * block_bytes)?;
+                let mut out = Vec::with_capacity(n);
+                for b in raw.chunks_exact(block_bytes) {
+                    if ty == GGML_Q4_K {
+                        dequant_q4k_block(b, &mut out);
+                    } else {
+                        dequant_q6k_block(b, &mut out);
+                    }
                 }
                 Ok(out)
             }
@@ -442,6 +537,64 @@ mod tests {
         assert_eq!(g.meta_usize("llama.block_count").unwrap(), 6);
         assert_eq!(g.tensor_f32("t").unwrap(), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
         assert!(g.tensor_f32("nope").is_err());
+    }
+
+    #[test]
+    fn q4k_block_dequantizes_known_values() {
+        // Craft a super-block with d=1.0, dmin=0.0 so y = sc[group] * nibble.
+        // 6-bit scales: groups 0..3 live in scales[0..4] (low 6 bits).
+        let mut b = vec![0u8; Q4_K_BLOCK_BYTES];
+        b[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1.0
+        b[2..4].copy_from_slice(&0x0000u16.to_le_bytes()); // dmin = 0.0
+        b[4] = 2; // group 0 scale = 2
+        b[5] = 3; // group 1 scale = 3 (second half of same 32 bytes)
+        // qs: first 32 bytes cover groups 0 (low nibbles) and 1 (high nibbles)
+        for i in 0..32 {
+            b[16 + i] = ((i % 16) as u8) | (((15 - i % 16) as u8) << 4);
+        }
+        let mut out = Vec::new();
+        dequant_q4k_block(&b, &mut out);
+        assert_eq!(out.len(), 256);
+        for i in 0..32 {
+            assert_eq!(out[i], 2.0 * (i % 16) as f32, "group0[{i}]");
+            assert_eq!(out[32 + i], 3.0 * (15 - i % 16) as f32, "group1[{i}]");
+        }
+        // dmin=0 and zero scales elsewhere -> rest decodes to 0.
+        assert!(out[64..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn q4k_packed_scale_min_high_groups_unpack() {
+        // Groups 4..7 pack 6-bit values across bytes; verify the bit surgery.
+        let mut s = [0u8; 12];
+        // Encode group 4: sc = 0b110101 (=53), m = 0b101011 (=43).
+        // Layout: low 4 bits of sc in s[8]&0xF, high 2 bits in s[0]>>6;
+        //         low 4 bits of m  in s[8]>>4,  high 2 bits in s[4]>>6.
+        s[8] = (53 & 0xF) | ((43 & 0xF) << 4);
+        s[0] = (53u8 >> 4) << 6;
+        s[4] = (43u8 >> 4) << 6;
+        let (sc, m) = q4k_scale_min(4, &s);
+        assert_eq!((sc, m), (53.0, 43.0));
+    }
+
+    #[test]
+    fn q6k_block_dequantizes_known_values() {
+        // d = 1.0, all 16 sub-block scales = 1: y[l] = q - 32 where q is the
+        // 6-bit value. Set ql[0] = 5 (low nibble), qh[0] = 2 (bits 0-1 -> +32
+        // ... actually bits<<4): q1 = 5 | (2<<4) = 37 -> y[0] = 5.
+        let mut b = vec![0u8; Q6_K_BLOCK_BYTES];
+        b[192..208].fill(1); // all 16 sub-block scales = 1
+        b[208..210].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1.0
+        b[0] = 5; // ql[0]
+        b[128] = 2; // qh[0]: bits 0-1 = 2
+        let mut out = Vec::new();
+        dequant_q6k_block(&b, &mut out);
+        assert_eq!(out.len(), 256);
+        assert_eq!(out[0], (5 + (2 << 4) - 32) as f32); // = 5.0
+        // Everything else in group 0's lane had q=0 -> value -32.
+        assert_eq!(out[1], -32.0);
+        // High-nibble group of the same byte: ql[0]>>4 = 0, qh bits 4-5 = 0.
+        assert_eq!(out[64], -32.0);
     }
 
     #[test]

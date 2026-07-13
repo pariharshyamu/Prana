@@ -6,8 +6,7 @@
 //! per-group scale). Decode-time matmul then multiplies a quantized weight
 //! matrix by fp32 activations, dequantizing on the fly.
 
-use crate::threading::default_threads;
-use std::thread;
+use std::sync::Mutex;
 
 /// Block size for Q8 quantization: 32 weights share one fp32 scale.
 /// Matches `KV_QUANT_GROUP_SIZE = 32` in `cactus-kernels/cactus_kernels.h`.
@@ -125,22 +124,23 @@ pub fn matmul_q8_f32(a: &[f32], w: &QuantMatrix, n_tokens: usize) -> Vec<f32> {
 
 /// Shared parallel driver for both matmul kernels.
 ///
-/// - **Decode** (`n_tokens == 1`): split the `n_rows` outputs across workers.
-/// - **Prefill** (`n_tokens > 1`): give each token's row of outputs to a worker.
+/// - **Decode** (`n_tokens == 1`): split the `n_rows` outputs across the pool.
+/// - **Prefill** (`n_tokens > 1`): give each token's row of outputs to a chunk.
 ///
-/// `dot(a_row, r)` computes one output element. `thread::scope` guarantees no
-/// worker outlives the borrowed `a`/`w`/`out`, so this is fully safe.
+/// `dot(a_row, r)` computes one output element. Work is fanned out on the
+/// persistent [`crate::pool`], so per-call cost is a wakeup, not a thread
+/// spawn — small per-layer projections can afford to parallelize. Disjoint
+/// output chunks are handed to workers through per-chunk `Mutex`es (locked
+/// exactly once each), keeping this function entirely safe.
 fn run_matmul<D>(out: &mut [f32], a: &[f32], n_tokens: usize, k: usize, n_rows: usize, dot: D)
 where
     D: Fn(&[f32], usize) -> f32 + Sync,
 {
-    let threads = default_threads();
+    let pool = crate::pool::global();
 
-    // Below this many MACs, thread spawn cost exceeds the work itself — run
-    // inline. A small model's per-layer projections (e.g. 288x288) land here;
-    // big projections and the LM head still fan out.
-    const MIN_MACS_FOR_THREADS: usize = 256 * 1024;
-    if n_tokens * k * n_rows < MIN_MACS_FOR_THREADS || threads == 1 {
+    // Below this many MACs even a pool wakeup costs more than the work.
+    const MIN_MACS_FOR_THREADS: usize = 32 * 1024;
+    if n_tokens * k * n_rows < MIN_MACS_FOR_THREADS || pool.threads == 1 {
         for t in 0..n_tokens {
             let a_row = &a[t * k..(t + 1) * k];
             for r in 0..n_rows {
@@ -152,31 +152,34 @@ where
 
     if n_tokens == 1 {
         let a_row = &a[0..k];
-        let row_chunk = n_rows.div_ceil(threads).max(1);
-        thread::scope(|scope| {
-            for (chunk_idx, slot) in out.chunks_mut(row_chunk).enumerate() {
-                let dot = &dot;
-                let r0 = chunk_idx * row_chunk;
-                scope.spawn(move || {
-                    for (i, o) in slot.iter_mut().enumerate() {
-                        *o = dot(a_row, r0 + i);
-                    }
-                });
+        let row_chunk = n_rows.div_ceil(pool.threads).max(1);
+        let chunks: Vec<Mutex<(usize, &mut [f32])>> = out
+            .chunks_mut(row_chunk)
+            .enumerate()
+            .map(|(i, slot)| Mutex::new((i * row_chunk, slot)))
+            .collect();
+        pool.run(chunks.len(), &|ci| {
+            let mut guard = chunks[ci].lock().unwrap();
+            let (r0, slot) = &mut *guard;
+            for (i, o) in slot.iter_mut().enumerate() {
+                *o = dot(a_row, *r0 + i);
             }
         });
         return;
     }
 
-    // Prefill: one worker per token, each fills that token's `n_rows` outputs.
-    thread::scope(|scope| {
-        for (t, slot) in out.chunks_mut(n_rows).enumerate() {
-            let dot = &dot;
-            let a_row = &a[t * k..(t + 1) * k];
-            scope.spawn(move || {
-                for (r, o) in slot.iter_mut().enumerate() {
-                    *o = dot(a_row, r);
-                }
-            });
+    // Prefill: one chunk per token, each fills that token's `n_rows` outputs.
+    let chunks: Vec<Mutex<(usize, &mut [f32])>> = out
+        .chunks_mut(n_rows)
+        .enumerate()
+        .map(|(t, slot)| Mutex::new((t, slot)))
+        .collect();
+    pool.run(chunks.len(), &|ci| {
+        let mut guard = chunks[ci].lock().unwrap();
+        let (t, slot) = &mut *guard;
+        let a_row = &a[*t * k..(*t + 1) * k];
+        for (r, o) in slot.iter_mut().enumerate() {
+            *o = dot(a_row, r);
         }
     });
 }
