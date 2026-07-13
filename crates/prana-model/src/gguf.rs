@@ -878,7 +878,9 @@ mod tests {
         }
         let x: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin()).collect();
         let want: f32 = x.iter().zip(&f).map(|(a, b)| a * b).sum();
-        assert!((lin.apply(&x)[0] - want).abs() < 1e-4);
+        // The native path quantizes activations to i8 (~0.5% group error).
+        let got = lin.apply(&x)[0];
+        assert!((got - want).abs() < 2e-2 * want.abs().max(1.0), "{got} vs {want}");
     }
 
     #[test]

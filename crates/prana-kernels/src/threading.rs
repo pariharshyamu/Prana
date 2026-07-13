@@ -40,8 +40,13 @@ where
     });
 }
 
-/// Default worker count: available parallelism, capped for sanity on big hosts.
+/// Default worker count: available parallelism, capped for sanity on big
+/// hosts. `PRANA_THREADS` overrides — on hybrid (P+E core) parts the best
+/// decode count is workload-dependent and worth measuring.
 pub fn default_threads() -> usize {
+    if let Some(n) = std::env::var("PRANA_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return n.max(1);
+    }
     thread::available_parallelism()
         .map(|n| n.get().min(8))
         .unwrap_or(1)

@@ -79,8 +79,11 @@ pub struct Pool {
 }
 
 /// Spin briefly before parking: decode-loop jobs arrive every few hundred
-/// microseconds, so spinning usually catches the next epoch without a syscall.
-const SPIN_ITERS: u32 = 30_000;
+/// microseconds (separated by the serial norm/rope/attention work between
+/// matmuls), so a generous spin keeps workers hot across those gaps —
+/// parked workers pay a futex wake before contributing, which on small
+/// per-layer projections means they arrive after the work is gone.
+const SPIN_ITERS: u32 = 200_000;
 
 impl Pool {
     fn new(threads: usize) -> Self {

@@ -294,7 +294,7 @@ fn bench() {
     let quant_bytes = qm.stored_bytes();
 
     println!("  problem           : [1 x {k}] * [{n_rows} x {k}]  (block={Q8_BLOCK})");
-    println!("  threads           : {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    println!("  threads           : {} (PRANA_THREADS overrides)", prana_kernels::pool().threads);
     println!();
     println!("  dense  f32 matmul : {dense_ms:>7.3} ms/iter   {dense_gflops:>6.1} GFLOP/s");
     println!("  quant  q8  matmul : {quant_ms:>7.3} ms/iter   {quant_gflops:>6.1} GFLOP/s");
@@ -304,11 +304,12 @@ fn bench() {
     println!("  max abs error     : {max_err:.4}  ({:.2}% of output RMS)", rel_err * 100.0);
     println!("\n  (sink={sink:.3})  # keeps the optimizer from eliding the loops");
     println!();
-    println!("  Honest reading: with the *scalar* kernel, Q8's win here is the");
-    println!("  3.5x smaller weight footprint, not speed — the per-element i8->f32");
-    println!("  cast doesn't autovectorize as well as the dense FMA, so on this");
-    println!("  cache-resident size Q8 is compute-bound and slightly slower. The");
-    println!("  speed win appears (a) at model sizes where weights spill L2/L3 and");
-    println!("  bandwidth dominates, and (b) once the target-gated NEON/AVX tier");
-    println!("  (same signatures) replaces the scalar dot products.");
+    println!("  Reading: the quantized matmul runs *integer* dot products — the");
+    println!("  activations are quantized to i8 per 32-group once per call, so the");
+    println!("  inner loop is int8 x int8 (32 MACs per AVX2 maddubs+madd pair vs 8");
+    println!("  f32 FMA lanes) and reads ~4x fewer weight bytes. It now wins on");
+    println!("  both footprint and speed. Accuracy cost: ~0.1% of output RMS, the");
+    println!("  same order as the weight quantization itself. End-to-end decode of");
+    println!("  a real model is DRAM-bandwidth-bound, so the tok/s gain there is");
+    println!("  smaller than this cache-resident kernel ratio suggests.");
 }

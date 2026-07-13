@@ -10,17 +10,17 @@
 //! dequantize-at-load) and reads 7x less weight memory per token, which is
 //! what decode is bound by.
 //!
-//! The native dot exploits the affine structure of Q4_K: within a 32-group,
-//! `y = d·sc·q − dmin·m`, so `Σ a·y = d·sc·(Σ a·q) − dmin·m·(Σ a)` — the
-//! activation group sums `Σ a` are computed once per row-batch and the `−m`
-//! term costs one multiply per group instead of 32.
+//! The native dots run in *integer* arithmetic: activations are quantized to
+//! i8 per 32-group once per matmul ([`crate::quantize_acts`]), so the inner
+//! loop is int8×int8 multiplies, and the affine terms (Q4_0's `−8`, Q4_K's
+//! `−dmin·m`) collapse to one multiply per group via the quantized groups'
+//! integer sums: `Σ a·(d·sc·q − dmin·m) ≈ sa·(d·sc·Σ qa·qw − dmin·m·Σ qa)`.
 //!
-//! Everything here is safe scalar Rust except the AVX2 Q4_K dot, which lives
-//! in `simd_x86` with the other intrinsics code.
+//! Everything here is safe scalar Rust except the AVX2 dots, which live in
+//! `simd_x86` with the other intrinsics code.
 
 use crate::f16_to_f32;
-use crate::pool;
-use std::sync::Mutex;
+use crate::matmul::{quantize_acts, run_rows, QuantActs};
 
 /// K-quant super-block width.
 pub const QK_K: usize = 256;
@@ -193,151 +193,124 @@ impl KQuantMatrix {
     }
 }
 
-/// Scalar Q4_0 row dot. `asums[g]` must hold `Σ a[g*32..g*32+32]`:
-/// `Σ a·d(q−8) = d·(Σ a·q − 8·Σ a)`, one multiply per block for the −8 term.
+/// Scalar integer Q4_0 row dot against quantized activations:
+/// `Σ a·d(q−8) ≈ d·sa·(Σ qa·q − 8·Σ qa)`.
 #[inline]
-fn dot_q40_scalar(a: &[f32], row: &[u8], asums: &[f32]) -> f32 {
+fn dot_q40_q8_scalar(acts: &QuantActs, row: &[u8]) -> f32 {
     let mut total = 0f32;
     for (i, b) in row.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
         let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
-        let a_lo = &a[i * 32..i * 32 + 16];
-        let a_hi = &a[i * 32 + 16..i * 32 + 32];
-        let mut s = 0f32;
+        let qa = &acts.q[i * 32..(i + 1) * 32];
+        let mut s = 0i32;
         for l in 0..16 {
-            s += a_lo[l] * (b[2 + l] & 0xF) as f32 + a_hi[l] * (b[2 + l] >> 4) as f32;
+            s += qa[l] as i32 * (b[2 + l] & 0xF) as i32
+                + qa[16 + l] as i32 * (b[2 + l] >> 4) as i32;
         }
-        total += d * (s - 8.0 * asums[i]);
+        total += d * acts.scales[i] * (s - 8 * acts.sums[i]) as f32;
     }
     total
 }
 
-/// Scalar Q4_K row dot. `asums[g]` must hold `Σ a[g*32..g*32+32]`.
+/// Scalar integer Q4_K row dot: per 32-group,
+/// `Σ a·(d·sc·q − dmin·m) ≈ sa·(d·sc·Σ qa·q − dmin·m·Σ qa)`.
 #[inline]
-fn dot_q4k_scalar(a: &[f32], row: &[u8], asums: &[f32]) -> f32 {
+fn dot_q4k_q8_scalar(acts: &QuantActs, row: &[u8]) -> f32 {
     let mut total = 0f32;
     for (b_idx, b) in row.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
         let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
         let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
         let scales = &b[4..16];
         let qs = &b[16..144];
-        let a_blk = &a[b_idx * QK_K..(b_idx + 1) * QK_K];
-        let s_blk = &asums[b_idx * 8..(b_idx + 1) * 8];
         for pair in 0..4 {
             let q = &qs[pair * 32..(pair + 1) * 32];
-            let a_lo = &a_blk[pair * 64..pair * 64 + 32];
-            let a_hi = &a_blk[pair * 64 + 32..pair * 64 + 64];
+            let g_lo = b_idx * 8 + pair * 2;
+            let g_hi = g_lo + 1;
+            let qa_lo = &acts.q[g_lo * 32..(g_lo + 1) * 32];
+            let qa_hi = &acts.q[g_hi * 32..(g_hi + 1) * 32];
             let (sc1, m1) = q4k_scale_min(pair * 2, scales);
             let (sc2, m2) = q4k_scale_min(pair * 2 + 1, scales);
-            let mut s1 = 0f32;
-            let mut s2 = 0f32;
+            let mut s1 = 0i32;
+            let mut s2 = 0i32;
             for l in 0..32 {
-                s1 += a_lo[l] * (q[l] & 0xF) as f32;
-                s2 += a_hi[l] * (q[l] >> 4) as f32;
+                s1 += qa_lo[l] as i32 * (q[l] & 0xF) as i32;
+                s2 += qa_hi[l] as i32 * (q[l] >> 4) as i32;
             }
-            total += d * sc1 * s1 - dmin * m1 * s_blk[pair * 2];
-            total += d * sc2 * s2 - dmin * m2 * s_blk[pair * 2 + 1];
+            total += acts.scales[g_lo] * (d * sc1 * s1 as f32 - dmin * m1 * acts.sums[g_lo] as f32);
+            total += acts.scales[g_hi] * (d * sc2 * s2 as f32 - dmin * m2 * acts.sums[g_hi] as f32);
         }
     }
     total
 }
 
-/// Scalar Q6_K row dot (no affine trick needed — Q6_K has no mins).
+/// Scalar integer Q6_K row dot (no affine trick needed — Q6_K has no mins;
+/// `q−32` fits i8 so the products accumulate in integers directly).
 #[inline]
-fn dot_q6k_scalar(a: &[f32], row: &[u8]) -> f32 {
+fn dot_q6k_q8_scalar(acts: &QuantActs, row: &[u8]) -> f32 {
     let mut total = 0f32;
     for (b_idx, b) in row.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
         let ql = &b[0..128];
         let qh = &b[128..192];
         let sc = &b[192..208];
         let d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
-        let a_blk = &a[b_idx * QK_K..(b_idx + 1) * QK_K];
+        let qa_blk = &acts.q[b_idx * QK_K..(b_idx + 1) * QK_K];
         for half in 0..2 {
             let (ql, qh, s0, ao) = (&ql[half * 64..], &qh[half * 32..], half * 8, half * 128);
-            let mut sums = [0f32; 8]; // per (group, sub) partial dots
+            let mut sums = [0i32; 8]; // per (group, sub) partial dots
             for l in 0..32 {
                 let sub = l / 16;
-                let q1 = (((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i8 - 32) as f32;
-                let q2 = (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32) as f32;
-                let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32) as f32;
-                let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32) as f32;
-                sums[sub] += a_blk[ao + l] * q1;
-                sums[2 + sub] += a_blk[ao + l + 32] * q2;
-                sums[4 + sub] += a_blk[ao + l + 64] * q3;
-                sums[6 + sub] += a_blk[ao + l + 96] * q4;
+                let q1 = ((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i8 as i32 - 32;
+                let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 as i32 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 as i32 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 as i32 - 32;
+                sums[sub] += qa_blk[ao + l] as i32 * q1;
+                sums[2 + sub] += qa_blk[ao + l + 32] as i32 * q2;
+                sums[4 + sub] += qa_blk[ao + l + 64] as i32 * q3;
+                sums[6 + sub] += qa_blk[ao + l + 96] as i32 * q4;
             }
             for (g, chunk) in sums.chunks_exact(2).enumerate() {
-                total += d * sc[s0 + g * 2] as i8 as f32 * chunk[0];
-                total += d * sc[s0 + g * 2 + 1] as i8 as f32 * chunk[1];
+                // Activation 32-group covering elements ao + g*32 of the block.
+                let sa = acts.scales[b_idx * 8 + half * 4 + g];
+                total += d * sa * sc[s0 + g * 2] as i8 as f32 * chunk[0] as f32;
+                total += d * sa * sc[s0 + g * 2 + 1] as i8 as f32 * chunk[1] as f32;
             }
         }
     }
     total
 }
 
-/// Per-32-group activation sums, shared by every row of a Q4_K matmul.
-fn group_sums(a: &[f32]) -> Vec<f32> {
-    a.chunks_exact(32).map(|c| c.iter().sum()).collect()
-}
-
-/// K-quant weight × f32 activation matmul. Output `[n_tokens, n_rows]`.
+/// Packed-quantized weight × f32 activation matmul. Activations are
+/// quantized to i8 once per row (integer inner loops); output
+/// `[n_tokens, n_rows]`.
 pub fn matmul_kquant_f32(a: &[f32], m: &KQuantMatrix, n_tokens: usize) -> Vec<f32> {
     let (k, n_rows) = (m.cols, m.rows);
     assert_eq!(a.len(), n_tokens * k);
     let mut out = vec![0f32; n_tokens * n_rows];
 
     for t in 0..n_tokens {
-        let a_row = &a[t * k..(t + 1) * k];
-        let asums = match m.kind {
-            KQuantKind::Q40 | KQuantKind::Q4K => group_sums(a_row),
-            KQuantKind::Q6K => Vec::new(),
-        };
-        let out_t = &mut out[t * n_rows..(t + 1) * n_rows];
-
+        let acts = quantize_acts(&a[t * k..(t + 1) * k]);
         let dot = |r: usize| -> f32 {
             let row = m.row(r);
             match m.kind {
                 KQuantKind::Q40 => {
                     if crate::simd_x86::available() {
                         // SAFETY: available() verified AVX2+FMA on this CPU.
-                        unsafe { crate::simd_x86::dot_q40(a_row, row, &asums) }
+                        unsafe { crate::simd_x86::dot_q40_q8(&acts, row) }
                     } else {
-                        dot_q40_scalar(a_row, row, &asums)
+                        dot_q40_q8_scalar(&acts, row)
                     }
                 }
                 KQuantKind::Q4K => {
                     if crate::simd_x86::available() {
                         // SAFETY: available() verified AVX2+FMA on this CPU.
-                        unsafe { crate::simd_x86::dot_q4k(a_row, row, &asums) }
+                        unsafe { crate::simd_x86::dot_q4k_q8(&acts, row) }
                     } else {
-                        dot_q4k_scalar(a_row, row, &asums)
+                        dot_q4k_q8_scalar(&acts, row)
                     }
                 }
-                KQuantKind::Q6K => dot_q6k_scalar(a_row, row),
+                KQuantKind::Q6K => dot_q6k_q8_scalar(&acts, row),
             }
         };
-
-        // ~4.5 bits/weight still means real work per row; parallelize rows on
-        // the pool for all but tiny matrices (same policy as run_matmul).
-        let pool = pool::global();
-        if k * n_rows < 32 * 1024 || pool.threads == 1 {
-            for (r, o) in out_t.iter_mut().enumerate() {
-                *o = dot(r);
-            }
-        } else {
-            let row_chunk = n_rows.div_ceil(pool.threads).max(1);
-            let chunks: Vec<Mutex<(usize, &mut [f32])>> = out_t
-                .chunks_mut(row_chunk)
-                .enumerate()
-                .map(|(i, slot)| Mutex::new((i * row_chunk, slot)))
-                .collect();
-            pool.run(chunks.len(), &|ci| {
-                let mut guard = chunks[ci].lock().unwrap();
-                let (r0, slot) = &mut *guard;
-                for (i, o) in slot.iter_mut().enumerate() {
-                    *o = dot(*r0 + i);
-                }
-            });
-        }
+        run_rows(&mut out[t * n_rows..(t + 1) * n_rows], k, dot);
     }
     out
 }
@@ -387,11 +360,22 @@ mod tests {
         let a: Vec<f32> = (0..n_tokens * cols).map(|i| (i as f32 * 0.013).sin()).collect();
 
         let native = matmul_kquant_f32(&a, &m, n_tokens);
-        let dense = matmul_f32(&a, &m.dequantize(), n_tokens, cols, rows);
+        // Reference: dequantized weights × *dequantized quantized* activations
+        // — the integer kernels see i8 activations, so the oracle must too;
+        // any remaining difference is a kernel bug, not quantization error.
+        let mut a_dq = Vec::with_capacity(a.len());
+        for row in a.chunks_exact(cols) {
+            let acts = quantize_acts(row);
+            a_dq.extend(
+                acts.q.iter().enumerate().map(|(i, &q)| q as f32 * acts.scales[i / 32]),
+            );
+        }
+        let dense = matmul_f32(&a_dq, &m.dequantize(), n_tokens, cols, rows);
 
         for (i, (n, d)) in native.iter().zip(&dense).enumerate() {
             // Random blocks can have large f16 scales; compare relatively.
-            let tol = 1e-4 * d.abs().max(1.0);
+            // (Integer path sums exactly; slack is f32 accumulation order.)
+            let tol = 1e-3 * d.abs().max(1.0);
             assert!((n - d).abs() < tol, "{kind:?}[{i}]: native {n} vs dequant {d}");
         }
     }
@@ -429,6 +413,43 @@ mod tests {
     fn q6k_native_matmul_matches_dequant_reference() {
         for seed in [7u64, 99, 54321] {
             check_matches_dequant_reference(KQuantKind::Q6K, seed);
+        }
+    }
+
+    #[test]
+    fn integer_simd_dots_match_scalar() {
+        if !crate::simd_x86::available() {
+            eprintln!("skipping: no AVX2+FMA on this CPU");
+            return;
+        }
+        for kind in [KQuantKind::Q40, KQuantKind::Q4K] {
+            let cols = QK_K * 2;
+            let bb = kind.block_bytes();
+            let mut row = pseudo_bytes(cols / kind.block_values() * bb, 31 + bb as u64);
+            for b in row.chunks_exact_mut(bb) {
+                b[0..2].copy_from_slice(&0x2e66u16.to_le_bytes());
+                if kind == KQuantKind::Q4K {
+                    b[2..4].copy_from_slice(&0x2a66u16.to_le_bytes());
+                }
+            }
+            let a: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.021).cos()).collect();
+            let acts = quantize_acts(&a);
+            let (scalar, simd) = match kind {
+                // SAFETY: available() checked above.
+                KQuantKind::Q40 => {
+                    (dot_q40_q8_scalar(&acts, &row), unsafe {
+                        crate::simd_x86::dot_q40_q8(&acts, &row)
+                    })
+                }
+                KQuantKind::Q4K => {
+                    (dot_q4k_q8_scalar(&acts, &row), unsafe {
+                        crate::simd_x86::dot_q4k_q8(&acts, &row)
+                    })
+                }
+                KQuantKind::Q6K => unreachable!(),
+            };
+            let tol = 1e-3 * scalar.abs().max(1.0);
+            assert!((scalar - simd).abs() < tol, "{kind:?}: {scalar} vs {simd}");
         }
     }
 

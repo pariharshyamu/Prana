@@ -97,16 +97,21 @@ Example:
 ```
 $ cargo run --release -p prana-cli -- bench
   problem           : [1 x 2048] * [2048 x 2048]  (block=32)
-  dense  f32 matmul :   0.664 ms/iter     12.6 GFLOP/s
-  quant  q8  matmul :   0.949 ms/iter      8.8 GFLOP/s
+  dense  f32 matmul :   1.141 ms/iter      7.4 GFLOP/s
+  quant  q8  matmul :   0.085 ms/iter     99.0 GFLOP/s
   weight memory     : 16384 KiB f32  ->  4608 KiB q8  (3.56x smaller)
-  max abs error     : 0.8181  (0.08% of output RMS)
+  max abs error     : 1.2964  (0.13% of output RMS)
 ```
 
-The benchmark is deliberately honest: with the scalar kernel tier, Q8's win at
-this cache-resident size is the **3.5× smaller weight footprint**, not speed —
-the raw-speed win from quantization appears at cache-spilling model sizes and
-once the target-gated NEON/AVX kernel tier lands. See EVALUATION.md §5.
+The quantized matmul runs **integer dot products**: activations are quantized
+to i8 per 32-group once per call (llama.cpp's approach), so the inner loop is
+int8×int8 — 32 MACs per AVX2 `maddubs`+`madd` pair versus 8 f32 FMA lanes —
+at ~0.1%-of-RMS accuracy cost. The honest caveat now points the other way:
+this cache-resident kernel ratio (13×) overstates the end-to-end gain, because
+real-model decode is DRAM-bandwidth-bound; the integer tier mainly buys
+compute headroom (prefill, many-core scaling) rather than single-stream
+decode tok/s. `PRANA_THREADS` overrides the worker-pool size — worth sweeping
+on hybrid P+E-core parts. See EVALUATION.md §5.
 
 ## Status & scope
 
@@ -132,9 +137,12 @@ llama2.c's reference output. Quantized tensors (Q4_0/Q4_K/Q6_K) run
 **natively in packed form** (4.5/6.6 bits per weight in RAM) with the AVX2
 tier — including the token-embedding table, whose rows dequantize per lookup
 instead of expanding to f32 at load — and native dots are parity-tested
-against dequantized dense matmuls. On an Intel Core Ultra 5 laptop the 0.5B
-instruct model decodes at ~31 tok/s (vs ~18 before packed-native Q4_0), with
-~410 MiB of weight memory (vs ~1.1 GiB).
+against dequantized dense matmuls, with all quantized matmuls running
+int8×int8 integer inner loops against per-32-group-quantized activations.
+On an Intel Core Ultra 5 laptop the 0.5B instruct model decodes at ~30 tok/s
+(vs ~18 before packed-native Q4_0) with ~410 MiB of weight memory (vs
+~1.1 GiB); throughput there is DRAM-bandwidth- and thermal-bound, not
+kernel-bound.
 
 Still out of scope: ARM NEON/Metal targets, safetensors, further
 architectures (Phi, Gemma-2 softcapping), exact GPT-2 pre-tokenizer regex,

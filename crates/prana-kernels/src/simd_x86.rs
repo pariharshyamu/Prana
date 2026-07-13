@@ -63,129 +63,131 @@ mod imp {
         }
     }
 
-    /// AVX2+FMA Q8-block dot product: `sum_g scale[g] * dot(a[g], q[g])`,
-    /// with 32-wide blocks (crate::Q8_BLOCK).
+    /// Sum of the 32 int8×int8 products in `x`·`y` as 8 i32 lanes.
+    /// Both inputs signed; `maddubs` needs one unsigned operand, so move
+    /// x's sign onto y (llama.cpp's `mul_sum_i8_pairs`): |x|·sign(y,x) ≡ x·y.
+    ///
+    /// # Safety
+    /// Requires AVX2 (guaranteed by the callers' target feature).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn i8_dot_i32(x: __m256i, y: __m256i) -> __m256i {
+        // Pure register ops — no memory access.
+        let ax = _mm256_sign_epi8(x, x);
+        let sy = _mm256_sign_epi8(y, x);
+        // u8×i8 pairs → i16 (max 2·127·127, fits), then i16 pairs → i32.
+        _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_set1_epi16(1))
+    }
+
+    /// AVX2 integer Q8×Q8 dot: `Σ_g sw[g]·sa[g]·Σ_32 qw·qa`.
     ///
     /// # Safety
     /// Caller must ensure the CPU supports AVX2+FMA (see [`available`]).
     #[target_feature(enable = "avx2,fma")]
-    pub unsafe fn dot_q8(a: &[f32], q: &[i8], scales: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), q.len());
-        debug_assert_eq!(a.len(), scales.len() * 32);
-        // SAFETY: per block g we touch a[g*32..g*32+32] and q likewise, both
-        // in-bounds because a.len() == q.len() == scales.len()*32.
+    pub unsafe fn dot_q8_q8(acts: &crate::matmul::QuantActs, q: &[i8], scales: &[f32]) -> f32 {
+        debug_assert_eq!(acts.q.len(), q.len());
+        debug_assert_eq!(q.len(), scales.len() * 32);
+        // SAFETY: per group g both loads cover [g*32, g*32+32), in-bounds by
+        // the debug-checked length relations; loadu tolerates unalignment.
+        // Lane sums stay < 2^17, exact in f32 after the convert.
         unsafe {
-            let mut total = _mm256_setzero_ps();
-            let (pa, pq) = (a.as_ptr(), q.as_ptr());
-            for (g, &scale) in scales.iter().enumerate() {
-                let base = g * 32;
-                let mut blk = _mm256_setzero_ps();
-                for j in 0..4 {
-                    let o = base + j * 8;
-                    // 8 int8 -> 8 int32 -> 8 f32, then FMA with activations.
-                    let qi = _mm256_cvtepi8_epi32(_mm_loadl_epi64(pq.add(o) as *const __m128i));
-                    let qf = _mm256_cvtepi32_ps(qi);
-                    blk = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(o)), qf, blk);
-                }
-                total = _mm256_fmadd_ps(blk, _mm256_set1_ps(scale), total);
+            let mut acc = _mm256_setzero_ps();
+            let (pa, pq) = (acts.q.as_ptr(), q.as_ptr());
+            for (g, &sw) in scales.iter().enumerate() {
+                let qa = _mm256_loadu_si256(pa.add(g * 32) as *const __m256i);
+                let qw = _mm256_loadu_si256(pq.add(g * 32) as *const __m256i);
+                let prod = _mm256_cvtepi32_ps(i8_dot_i32(qw, qa));
+                acc = _mm256_fmadd_ps(prod, _mm256_set1_ps(sw * acts.scales[g]), acc);
             }
-            hsum(total)
+            hsum(acc)
         }
     }
 
-    /// AVX2+FMA native Q4_0 row dot over packed 18-byte blocks.
-    /// `asums[g]` must hold the activation sum of 32-group `g`:
-    /// `Σ a·d(q−8) = d·(Σ a·q − 8·Σ a)`.
+    /// AVX2 integer Q4_0 row dot over packed 18-byte blocks:
+    /// `Σ a·d(q−8) ≈ d·sa·(Σ qa·q − 8·Σ qa)`.
     ///
     /// # Safety
     /// Caller must ensure the CPU supports AVX2+FMA (see [`available`]).
     #[target_feature(enable = "avx2,fma")]
-    pub unsafe fn dot_q40(a: &[f32], row: &[u8], asums: &[f32]) -> f32 {
+    pub unsafe fn dot_q40_q8(acts: &crate::matmul::QuantActs, row: &[u8]) -> f32 {
         use crate::kquant::{Q4_0_BLOCK, Q4_0_BLOCK_BYTES};
         debug_assert_eq!(row.len() % Q4_0_BLOCK_BYTES, 0);
-        debug_assert_eq!(a.len(), row.len() / Q4_0_BLOCK_BYTES * Q4_0_BLOCK);
-        debug_assert_eq!(asums.len(), row.len() / Q4_0_BLOCK_BYTES);
+        debug_assert_eq!(acts.q.len(), row.len() / Q4_0_BLOCK_BYTES * Q4_0_BLOCK);
 
-        let mut total = 0f32;
         // SAFETY: per block we load 16 quant bytes at offset 2 of an 18-byte
-        // block and 32 activations of a's matching window, in-bounds by the
-        // debug-checked length relations; loadu tolerates unaligned addresses.
+        // block and the matching 32 i8 activations, in-bounds by the
+        // debug-checked length relations. Weight nibbles are unsigned 0..15,
+        // so they take maddubs' unsigned slot directly.
         unsafe {
             let nib_mask = _mm_set1_epi8(0x0F);
+            let ones = _mm256_set1_epi16(1);
+            let mut acc = _mm256_setzero_ps();
+            let mut corr = 0f32; // Σ d·sa·8·Σqa, subtracted once at the end
             for (i, b) in row.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
-                let d = crate::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
-                let a_blk = a.as_ptr().add(i * Q4_0_BLOCK);
+                let d_sa = crate::f16_to_f32(u16::from_le_bytes([b[0], b[1]])) * acts.scales[i];
                 let bytes = _mm_loadu_si128(b.as_ptr().add(2) as *const __m128i);
                 let lo = _mm_and_si128(bytes, nib_mask); // elements 0..16
                 let hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), nib_mask); // 16..32
-                let mut acc = _mm256_setzero_ps();
-                for j in 0..2 {
-                    let lo8 = if j == 0 { lo } else { _mm_srli_si128(lo, 8) };
-                    let hi8 = if j == 0 { hi } else { _mm_srli_si128(hi, 8) };
-                    let lo_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo8));
-                    let hi_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi8));
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(a_blk.add(j * 8)), lo_f, acc);
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(a_blk.add(16 + j * 8)), hi_f, acc);
-                }
-                total += d * (hsum(acc) - 8.0 * asums[i]);
+                let qw = _mm256_set_m128i(hi, lo);
+                let qa = _mm256_loadu_si256(acts.q.as_ptr().add(i * 32) as *const __m256i);
+                let p16 = _mm256_maddubs_epi16(qw, qa); // u4×i8 pairs, fits i16
+                let p32 = _mm256_cvtepi32_ps(_mm256_madd_epi16(p16, ones));
+                acc = _mm256_fmadd_ps(p32, _mm256_set1_ps(d_sa), acc);
+                corr += d_sa * 8.0 * acts.sums[i] as f32;
             }
+            hsum(acc) - corr
         }
-        total
     }
 
-    /// AVX2+FMA native Q4_K row dot over packed 144-byte super-blocks.
-    /// `asums[g]` must hold the activation sum of 32-group `g` (the affine
-    /// `−dmin·m` term needs only Σa, not the per-element products).
+    /// AVX2 integer Q4_K row dot over packed 144-byte super-blocks: per
+    /// 32-group, `Σ a·(d·sc·q − dmin·m) ≈ sa·(d·sc·Σ qa·q − dmin·m·Σ qa)`.
     ///
     /// # Safety
     /// Caller must ensure the CPU supports AVX2+FMA (see [`available`]).
     #[target_feature(enable = "avx2,fma")]
-    pub unsafe fn dot_q4k(a: &[f32], row: &[u8], asums: &[f32]) -> f32 {
+    pub unsafe fn dot_q4k_q8(acts: &crate::matmul::QuantActs, row: &[u8]) -> f32 {
         use crate::kquant::{q4k_scale_min, Q4_K_BLOCK_BYTES, QK_K};
         debug_assert_eq!(row.len() % Q4_K_BLOCK_BYTES, 0);
-        debug_assert_eq!(a.len(), row.len() / Q4_K_BLOCK_BYTES * QK_K);
+        debug_assert_eq!(acts.q.len(), row.len() / Q4_K_BLOCK_BYTES * QK_K);
 
         let mut total = 0f32;
-        // SAFETY: every load below stays inside one 144-byte block (16-byte
-        // loads at qs offsets 0/16 of a 128-byte field) and inside a's
-        // matching 256-float window, both guaranteed by the debug-checked
-        // length relations; loadu tolerates unaligned addresses.
+        // SAFETY: every load stays inside one 144-byte block (32 qs bytes at
+        // offsets 16/48/80/112) or the matching 256-i8 activation window,
+        // in-bounds by the debug-checked length relations. Group sums stay
+        // < 2^17 per lane pair, exact in f32 after the convert.
         unsafe {
-            let nib_mask = _mm_set1_epi8(0x0F);
+            let nib_mask = _mm256_set1_epi8(0x0F);
+            let ones = _mm256_set1_epi16(1);
             for (b_idx, b) in row.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
                 let d = crate::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
                 let dmin = crate::f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
                 let scales = &b[4..16];
                 let qs = b.as_ptr().add(16);
-                let a_blk = a.as_ptr().add(b_idx * QK_K);
-                let s_blk = &asums[b_idx * 8..(b_idx + 1) * 8];
+                let pa = acts.q.as_ptr().add(b_idx * QK_K);
 
                 for pair in 0..4 {
-                    let q = qs.add(pair * 32);
-                    let a_lo = a_blk.add(pair * 64);
-                    let a_hi = a_blk.add(pair * 64 + 32);
-                    let mut acc_lo = _mm256_setzero_ps();
-                    let mut acc_hi = _mm256_setzero_ps();
-                    // 32 bytes = two 16-byte halves; each half yields 16 low
-                    // and 16 high nibbles, converted 8 lanes at a time.
-                    for h in 0..2 {
-                        let bytes = _mm_loadu_si128(q.add(h * 16) as *const __m128i);
-                        let lo = _mm_and_si128(bytes, nib_mask);
-                        let hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), nib_mask);
-                        for j in 0..2 {
-                            let off = h * 16 + j * 8;
-                            let lo8 = if j == 0 { lo } else { _mm_srli_si128(lo, 8) };
-                            let hi8 = if j == 0 { hi } else { _mm_srli_si128(hi, 8) };
-                            let lo_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo8));
-                            let hi_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi8));
-                            acc_lo = _mm256_fmadd_ps(_mm256_loadu_ps(a_lo.add(off)), lo_f, acc_lo);
-                            acc_hi = _mm256_fmadd_ps(_mm256_loadu_ps(a_hi.add(off)), hi_f, acc_hi);
-                        }
-                    }
+                    // 32 qs bytes: low nibbles are group 2p, high are 2p+1.
+                    let bytes = _mm256_loadu_si256(qs.add(pair * 32) as *const __m256i);
+                    let lo = _mm256_and_si256(bytes, nib_mask);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), nib_mask);
+                    let qa_lo = _mm256_loadu_si256(pa.add(pair * 64) as *const __m256i);
+                    let qa_hi = _mm256_loadu_si256(pa.add(pair * 64 + 32) as *const __m256i);
+                    let s1 = hsum(_mm256_cvtepi32_ps(_mm256_madd_epi16(
+                        _mm256_maddubs_epi16(lo, qa_lo),
+                        ones,
+                    )));
+                    let s2 = hsum(_mm256_cvtepi32_ps(_mm256_madd_epi16(
+                        _mm256_maddubs_epi16(hi, qa_hi),
+                        ones,
+                    )));
+                    let g_lo = b_idx * 8 + pair * 2;
+                    let g_hi = g_lo + 1;
                     let (sc1, m1) = q4k_scale_min(pair * 2, scales);
                     let (sc2, m2) = q4k_scale_min(pair * 2 + 1, scales);
-                    total += d * sc1 * hsum(acc_lo) - dmin * m1 * s_blk[pair * 2];
-                    total += d * sc2 * hsum(acc_hi) - dmin * m2 * s_blk[pair * 2 + 1];
+                    total += acts.scales[g_lo]
+                        * (d * sc1 * s1 - dmin * m1 * acts.sums[g_lo] as f32);
+                    total += acts.scales[g_hi]
+                        * (d * sc2 * s2 - dmin * m2 * acts.sums[g_hi] as f32);
                 }
             }
         }
@@ -205,26 +207,26 @@ mod imp {
     }
     /// # Safety
     /// Never callable: `available()` is always false on this target.
-    pub unsafe fn dot_q8(_a: &[f32], _q: &[i8], _scales: &[f32]) -> f32 {
+    pub unsafe fn dot_q8_q8(_acts: &crate::matmul::QuantActs, _q: &[i8], _scales: &[f32]) -> f32 {
         unreachable!("simd tier unavailable on this target")
     }
     /// # Safety
     /// Never callable: `available()` is always false on this target.
-    pub unsafe fn dot_q4k(_a: &[f32], _row: &[u8], _asums: &[f32]) -> f32 {
+    pub unsafe fn dot_q4k_q8(_acts: &crate::matmul::QuantActs, _row: &[u8]) -> f32 {
         unreachable!("simd tier unavailable on this target")
     }
     /// # Safety
     /// Never callable: `available()` is always false on this target.
-    pub unsafe fn dot_q40(_a: &[f32], _row: &[u8], _asums: &[f32]) -> f32 {
+    pub unsafe fn dot_q40_q8(_acts: &crate::matmul::QuantActs, _row: &[u8]) -> f32 {
         unreachable!("simd tier unavailable on this target")
     }
 }
 
-pub use imp::{available, dot_f32, dot_q40, dot_q4k, dot_q8};
+pub use imp::{available, dot_f32, dot_q40_q8, dot_q4k_q8, dot_q8_q8};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
-    use crate::matmul::{dot_f32_scalar, dot_q8_scalar};
+    use crate::matmul::dot_f32_scalar;
 
     #[test]
     fn simd_dot_f32_matches_scalar() {
@@ -244,19 +246,22 @@ mod tests {
     }
 
     #[test]
-    fn simd_dot_q8_matches_scalar() {
+    fn simd_dot_q8_q8_matches_scalar() {
         if !super::available() {
             eprintln!("skipping: no AVX2+FMA on this CPU");
             return;
         }
         for blocks in [1usize, 2, 9, 64] {
             let n = blocks * 32;
-            let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011).sin()).collect();
+            // Extreme activations included: ±amax quantizes to ±127, the
+            // worst case for the maddubs i16 bound.
+            let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).sin() * 3.0).collect();
+            let acts = crate::matmul::quantize_acts(&a);
             let q: Vec<i8> = (0..n).map(|i| ((i * 37) % 255) as i8).collect();
             let scales: Vec<f32> = (0..blocks).map(|g| 0.01 + g as f32 * 0.003).collect();
-            let scalar = dot_q8_scalar(&a, &q, &scales);
+            let scalar = crate::matmul::dot_q8_q8_scalar(&acts, &q, &scales);
             // SAFETY: available() checked above.
-            let simd = unsafe { super::dot_q8(&a, &q, &scales) };
+            let simd = unsafe { super::dot_q8_q8(&acts, &q, &scales) };
             let tol = 1e-3 * (n as f32).sqrt();
             assert!((scalar - simd).abs() < tol, "blocks={blocks}: {scalar} vs {simd}");
         }

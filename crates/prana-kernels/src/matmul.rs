@@ -75,6 +75,49 @@ pub fn quantize_q8(rows: usize, cols: usize, w: &[f32]) -> QuantMatrix {
     QuantMatrix { rows, cols, q, scales }
 }
 
+/// One activation row quantized to i8 in `Q8_BLOCK`-wide groups.
+///
+/// This is the llama.cpp trick that makes quantized-weight matmuls fast on
+/// CPU: with *both* sides in int8, the inner loop becomes integer multiplies
+/// (32 MACs per AVX2 `maddubs`+`madd` pair vs 8 f32 FMA lanes), and the
+/// per-group `sums` let affine corrections (Q4_0's `−8`, Q4_K's `−dmin·m`)
+/// cost one multiply per group. Quantizing the activations once per matmul
+/// adds ~0.1% RMS error — the same order as the weight quantization already
+/// present — in exchange for ~4x the dot-product throughput per core.
+pub struct QuantActs {
+    pub q: Vec<i8>,
+    /// One f32 scale per 32-group.
+    pub scales: Vec<f32>,
+    /// Integer sum of each group's quants (for affine correction terms).
+    pub sums: Vec<i32>,
+}
+
+/// Quantize one activation row (length must be a multiple of `Q8_BLOCK`,
+/// which every model dimension we load already is).
+pub fn quantize_acts(a: &[f32]) -> QuantActs {
+    assert!(a.len().is_multiple_of(Q8_BLOCK));
+    let groups = a.len() / Q8_BLOCK;
+    let mut q = vec![0i8; a.len()];
+    let mut scales = vec![0f32; groups];
+    let mut sums = vec![0i32; groups];
+    for g in 0..groups {
+        let base = g * Q8_BLOCK;
+        let block = &a[base..base + Q8_BLOCK];
+        let amax = block.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        let inv = 1.0 / scale;
+        let mut sum = 0i32;
+        for (i, &x) in block.iter().enumerate() {
+            let v = (x * inv).round().clamp(-127.0, 127.0) as i32;
+            q[base + i] = v as i8;
+            sum += v;
+        }
+        scales[g] = scale;
+        sums[g] = sum;
+    }
+    QuantActs { q, scales, sums }
+}
+
 /// Reconstruct a dense f32 matrix from Q8 (for error measurement / tests).
 pub fn dequantize_q8(m: &QuantMatrix) -> Vec<f32> {
     let groups_per_row = m.groups_per_row();
@@ -105,7 +148,8 @@ pub fn matmul_f32(a: &[f32], w: &[f32], n_tokens: usize, k: usize, n_rows: usize
     out
 }
 
-/// Q8 weight × f32 activation matmul, dequantizing on the fly.
+/// Q8 weight × f32 activation matmul. Activations are quantized to i8 once
+/// per row, then every weight row is dotted in integer arithmetic.
 /// Output is `[n_tokens, n_rows]`.
 pub fn matmul_q8_f32(a: &[f32], w: &QuantMatrix, n_tokens: usize) -> Vec<f32> {
     let k = w.cols;
@@ -113,12 +157,15 @@ pub fn matmul_q8_f32(a: &[f32], w: &QuantMatrix, n_tokens: usize) -> Vec<f32> {
     assert_eq!(a.len(), n_tokens * k);
     let groups_per_row = w.groups_per_row();
     let mut out = vec![0f32; n_tokens * n_rows];
-    let dot = |a_row: &[f32], r: usize| {
-        let q_row = &w.q[r * k..(r + 1) * k];
-        let s_row = &w.scales[r * groups_per_row..(r + 1) * groups_per_row];
-        dot_q8(a_row, q_row, s_row)
-    };
-    run_matmul(&mut out, a, n_tokens, k, n_rows, dot);
+    for t in 0..n_tokens {
+        let acts = quantize_acts(&a[t * k..(t + 1) * k]);
+        let dot = |r: usize| {
+            let q_row = &w.q[r * k..(r + 1) * k];
+            let s_row = &w.scales[r * groups_per_row..(r + 1) * groups_per_row];
+            dot_q8_q8(&acts, q_row, s_row)
+        };
+        run_rows(&mut out[t * n_rows..(t + 1) * n_rows], k, dot);
+    }
     out
 }
 
@@ -184,6 +231,40 @@ where
     });
 }
 
+/// Row-parallel driver for one token's outputs: split `out` (one element per
+/// weight row, `k` MACs each) across the persistent pool. Shared by every
+/// quantized matmul, where per-token activation prep happens before fan-out.
+pub(crate) fn run_rows<D>(out: &mut [f32], k: usize, dot: D)
+where
+    D: Fn(usize) -> f32 + Sync,
+{
+    let pool = crate::pool::global();
+    const MIN_MACS_FOR_THREADS: usize = 32 * 1024;
+    if k * out.len() < MIN_MACS_FOR_THREADS || pool.threads == 1 {
+        for (r, o) in out.iter_mut().enumerate() {
+            *o = dot(r);
+        }
+        return;
+    }
+    // Several chunks per thread, not one: with work stealing, finer chunks
+    // let fast cores absorb the slack when P- and E-cores run at different
+    // speeds — equal-size one-per-thread chunks would make every matmul
+    // wait for the slowest core.
+    let row_chunk = out.len().div_ceil(pool.threads * 4).max(16);
+    let chunks: Vec<Mutex<(usize, &mut [f32])>> = out
+        .chunks_mut(row_chunk)
+        .enumerate()
+        .map(|(i, slot)| Mutex::new((i * row_chunk, slot)))
+        .collect();
+    pool.run(chunks.len(), &|ci| {
+        let mut guard = chunks[ci].lock().unwrap();
+        let (r0, slot) = &mut *guard;
+        for (i, o) in slot.iter_mut().enumerate() {
+            *o = dot(*r0 + i);
+        }
+    });
+}
+
 /// Dense dot product: SIMD tier when the CPU supports it, scalar otherwise.
 #[inline]
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
@@ -194,14 +275,14 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     dot_f32_scalar(a, b)
 }
 
-/// Q8-block dot product: SIMD tier when the CPU supports it, scalar otherwise.
+/// Integer Q8×Q8 dot product: SIMD tier when available, scalar otherwise.
 #[inline]
-fn dot_q8(a: &[f32], q: &[i8], scales: &[f32]) -> f32 {
+fn dot_q8_q8(acts: &QuantActs, q: &[i8], scales: &[f32]) -> f32 {
     if crate::simd_x86::available() {
         // SAFETY: available() verified AVX2+FMA support on this CPU.
-        return unsafe { crate::simd_x86::dot_q8(a, q, scales) };
+        return unsafe { crate::simd_x86::dot_q8_q8(acts, q, scales) };
     }
-    dot_q8_scalar(a, q, scales)
+    dot_q8_q8_scalar(acts, q, scales)
 }
 
 #[inline]
@@ -221,20 +302,17 @@ pub(crate) fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Scalar integer Q8×Q8 dot: `Σ_g sw[g]·sa[g]·Σ_32 qw·qa`.
 #[inline]
-pub(crate) fn dot_q8_scalar(a: &[f32], q: &[i8], scales: &[f32]) -> f32 {
+pub(crate) fn dot_q8_q8_scalar(acts: &QuantActs, q: &[i8], scales: &[f32]) -> f32 {
     let mut sum = 0f32;
-    for (g, &scale) in scales.iter().enumerate() {
+    for (g, &sw) in scales.iter().enumerate() {
         let base = g * Q8_BLOCK;
-        let mut acc = [0f32; 4];
-        let a_blk = &a[base..base + Q8_BLOCK];
-        let q_blk = &q[base..base + Q8_BLOCK];
-        for l in 0..Q8_BLOCK / 4 {
-            for j in 0..4 {
-                acc[j] += a_blk[l * 4 + j] * q_blk[l * 4 + j] as f32;
-            }
+        let mut acc = 0i32;
+        for l in 0..Q8_BLOCK {
+            acc += acts.q[base + l] as i32 * q[base + l] as i32;
         }
-        sum += scale * (acc[0] + acc[1] + acc[2] + acc[3]);
+        sum += sw * acts.scales[g] * acc as f32;
     }
     sum
 }
