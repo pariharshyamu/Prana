@@ -1,11 +1,12 @@
 //! GGUF loader — the container format the modern local-model ecosystem
 //! (llama.cpp, Ollama, LM Studio) distributes weights in.
 //!
-//! Supports GGUF v2/v3 little-endian files with F32, F16, and Q8_0 tensors,
-//! the `llama` architecture metadata keys, and the embedded SentencePiece
-//! tokenizer (`tokenizer.ggml.tokens` / `.scores`). Q8_0 blocks (32 × i8 +
-//! one f16 scale) map 1:1 onto Prana's `QuantMatrix` layout, so quantized
-//! GGUF tensors are used *natively* — no dequantize-requantize round trip.
+//! Supports GGUF v2/v3 little-endian files with F32, F16, Q4_0, Q8_0, Q4_K
+//! and Q6_K tensors, llama/qwen2/gemma architecture metadata keys, and the
+//! embedded tokenizer (SentencePiece or GPT-2 BPE). Q8_0 blocks (32 × i8 +
+//! one f16 scale) map 1:1 onto Prana's `QuantMatrix` layout, and Q4_0
+//! embeds in it losslessly, so quantized GGUF tensors are used *natively* —
+//! no dequantize-requantize round trip. K-quants stay packed (see kquant).
 //!
 //! GGUF llama models use the interleaved (adjacent-pair) RoPE convention
 //! (ggml `ROPE_TYPE_NORM`; HF-permuted checkpoints are un-permuted by the
@@ -18,12 +19,12 @@ use std::io;
 use std::path::Path;
 
 use prana_kernels::{
-    dequant_q4k_block, dequant_q6k_block, KQuantKind, KQuantMatrix, QuantMatrix,
-    Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_BLOCK, QK_K,
+    dequant_q40_block, dequant_q4k_block, dequant_q6k_block, KQuantKind, KQuantMatrix,
+    QuantMatrix, Q4_0_BLOCK_BYTES, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_BLOCK, QK_K,
 };
 pub use prana_kernels::f16_to_f32;
 
-use crate::checkpoint::{Activation, Config, Layer, Linear, Model, Precision};
+use crate::checkpoint::{Activation, Config, Embedding, Layer, Linear, Model, Precision};
 use crate::tokenizer::{AnyTokenizer, Tokenizer};
 
 const MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
@@ -31,6 +32,7 @@ const MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
 // ggml tensor dtypes we support.
 const GGML_F32: u32 = 0;
 const GGML_F16: u32 = 1;
+const GGML_Q4_0: u32 = 2;
 const GGML_Q8_0: u32 = 8;
 const GGML_Q4_K: u32 = 12;
 const GGML_Q6_K: u32 = 14;
@@ -217,6 +219,18 @@ impl Gguf {
                 .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
                 .collect()),
+            GGML_Q4_0 => {
+                if !n.is_multiple_of(Q8_BLOCK) {
+                    return Err(err(format!("Q4_0 tensor '{name}' not block-aligned")));
+                }
+                let blocks = n / Q8_BLOCK;
+                let raw = self.raw(info, blocks * Q4_0_BLOCK_BYTES)?;
+                let mut out = Vec::with_capacity(n);
+                for b in raw.chunks_exact(Q4_0_BLOCK_BYTES) {
+                    dequant_q40_block(b, &mut out);
+                }
+                Ok(out)
+            }
             GGML_Q8_0 => {
                 if !n.is_multiple_of(Q8_BLOCK) {
                     return Err(err(format!("Q8_0 tensor '{name}' not block-aligned")));
@@ -273,15 +287,42 @@ impl Gguf {
             }
             return Ok(Linear::Q8(QuantMatrix::from_parts(rows, cols, q, scales)));
         }
-        // K-quant tensors likewise stay packed and run on the native
-        // K-quant matmul (4.5 / 6.6 bits per weight in RAM).
-        if matches!(info.ggml_type, GGML_Q4_K | GGML_Q6_K) && cols.is_multiple_of(QK_K) {
-            let kind = if info.ggml_type == GGML_Q4_K { KQuantKind::Q4K } else { KQuantKind::Q6K };
-            let blocks = rows * cols / QK_K;
+        // Q4_0 and the K-quants stay in their packed block form and run on
+        // the native quantized matmul (4.5 / 6.6 bits per weight in RAM —
+        // decode is bandwidth-bound, so bits-in-RAM is tokens-per-second).
+        let kind = match info.ggml_type {
+            GGML_Q4_0 if cols.is_multiple_of(Q8_BLOCK) => Some(KQuantKind::Q40),
+            GGML_Q4_K if cols.is_multiple_of(QK_K) => Some(KQuantKind::Q4K),
+            GGML_Q6_K if cols.is_multiple_of(QK_K) => Some(KQuantKind::Q6K),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let blocks = rows * cols / kind.block_values();
             let raw = self.raw(info, blocks * kind.block_bytes())?.to_vec();
             return Ok(Linear::KQuant(KQuantMatrix::from_raw(rows, cols, kind, raw)));
         }
         Ok(Linear::new(self.tensor_f32(name)?, rows, cols, precision))
+    }
+
+    /// Read the token-embedding table, keeping supported quantized types
+    /// packed (rows are dequantized per lookup at inference time).
+    fn embedding(&self, name: &str) -> io::Result<Embedding> {
+        let info = self.info(name)?;
+        if info.dims.len() == 2 {
+            let (cols, rows) = (info.dims[0], info.dims[1]);
+            let kind = match info.ggml_type {
+                GGML_Q4_0 if cols.is_multiple_of(Q8_BLOCK) => Some(KQuantKind::Q40),
+                GGML_Q4_K if cols.is_multiple_of(QK_K) => Some(KQuantKind::Q4K),
+                GGML_Q6_K if cols.is_multiple_of(QK_K) => Some(KQuantKind::Q6K),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let blocks = rows * cols / kind.block_values();
+                let raw = self.raw(info, blocks * kind.block_bytes())?.to_vec();
+                return Ok(Embedding::KQuant(KQuantMatrix::from_raw(rows, cols, kind, raw)));
+            }
+        }
+        Ok(Embedding::F32(self.tensor_f32(name)?))
     }
 
     fn meta_usize(&self, key: &str) -> io::Result<usize> {
@@ -337,8 +378,8 @@ pub fn load(path: &Path, precision: Precision) -> io::Result<(Model, AnyTokenize
     let tokenizer = load_tokenizer(&g)?;
     let vocab_size = tokenizer.vocab_size();
 
-    let mut tok_emb = g.tensor_f32("token_embd.weight")?;
-    if tok_emb.len() != vocab_size * dim {
+    let tok_emb = g.embedding("token_embd.weight")?;
+    if tok_emb.n_values() != vocab_size * dim {
         return Err(err("token_embd.weight size mismatch with vocab"));
     }
     // llama.cpp stores gemma norm weights as (w - 1) relative to their
@@ -381,12 +422,13 @@ pub fn load(path: &Path, precision: Precision) -> io::Result<(Model, AnyTokenize
 
     let rms_final = fold_one(g.tensor_f32("output_norm.weight")?);
 
-    // Tied-embedding models omit output.weight.
+    // Tied-embedding models omit output.weight. A quantized table needs no
+    // wcls at all — `Model::logits` runs the native kernel over it directly.
     let shared_classifier = !g.tensors.contains_key("output.weight");
     let wcls = if shared_classifier {
-        match precision {
-            Precision::Q8 if dim.is_multiple_of(Q8_BLOCK) => {
-                Some(Linear::new(tok_emb.clone(), vocab_size, dim, Precision::Q8))
+        match (&tok_emb, precision) {
+            (Embedding::F32(w), Precision::Q8) if dim.is_multiple_of(Q8_BLOCK) => {
+                Some(Linear::new(w.clone(), vocab_size, dim, Precision::Q8))
             }
             _ => None,
         }
@@ -412,11 +454,8 @@ pub fn load(path: &Path, precision: Precision) -> io::Result<(Model, AnyTokenize
         act: if is_gemma { Activation::GeluTanh } else { Activation::Silu },
         emb_scale: if is_gemma { (dim as f32).sqrt() } else { 1.0 },
     };
-    if is_gemma {
-        // Gemma ties the classifier and scales embeddings; nothing extra to
-        // do here (scale applies at lookup), but keep tok_emb unscaled.
-        let _ = &mut tok_emb;
-    }
+    // Gemma's √dim embedding scale applies at lookup (emb_scale above), so
+    // the stored table stays unscaled for the tied classifier.
     Ok((Model { config, tok_emb, layers, rms_final, wcls }, tokenizer))
 }
 
@@ -479,7 +518,19 @@ fn load_tokenizer(g: &Gguf) -> io::Result<AnyTokenizer> {
                     .collect(),
                 _ => return Err(err("gpt2 tokenizer requires tokenizer.ggml.merges")),
             };
-            let tok = crate::bpe::BpeTokenizer::new(vocab, &merges, bos.map(|v| v as u32), eos.map(|v| v as u32), add_bos);
+            // token_type 3 (CONTROL) / 4 (USER_DEFINED) mark tokens that
+            // encode verbatim (chat-template markers like <|im_start|>).
+            let specials: Vec<(String, u32)> = match g.metadata.get("tokenizer.ggml.token_type") {
+                Some(Value::Arr(types)) => types
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| matches!(t.as_usize(), Some(3) | Some(4)))
+                    .map(|(id, _)| (vocab[id].clone(), id as u32))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let tok = crate::bpe::BpeTokenizer::new(vocab, &merges, bos.map(|v| v as u32), eos.map(|v| v as u32), add_bos)
+                .with_specials(specials);
             Ok(AnyTokenizer::Bpe(Box::new(tok)))
         }
         other => Err(err(format!("unsupported tokenizer.ggml.model '{other}'"))),
@@ -779,6 +830,55 @@ mod tests {
         assert_eq!(out[1], -32.0);
         // High-nibble group of the same byte: ql[0]>>4 = 0, qh bits 4-5 = 0.
         assert_eq!(out[64], -32.0);
+    }
+
+    #[test]
+    fn q4_0_tensor_loads_natively_packed() {
+        // One row of 64 values as two Q4_0 blocks. Block 0: d=1.0, nibble
+        // pattern j (low) / 15-j (high). Block 1: d=0.5, all nibbles 0xC.
+        let mut w = W(Vec::new());
+        w.0.extend_from_slice(&MAGIC.to_le_bytes());
+        w.0.extend_from_slice(&3u32.to_le_bytes());
+        w.0.extend_from_slice(&1u64.to_le_bytes());
+        w.0.extend_from_slice(&0u64.to_le_bytes());
+        w.str_(b"w");
+        w.0.extend_from_slice(&2u32.to_le_bytes());
+        w.0.extend_from_slice(&64u64.to_le_bytes()); // cols
+        w.0.extend_from_slice(&1u64.to_le_bytes()); // rows
+        w.0.extend_from_slice(&GGML_Q4_0.to_le_bytes());
+        w.0.extend_from_slice(&0u64.to_le_bytes());
+        while !w.0.len().is_multiple_of(32) {
+            w.0.push(0);
+        }
+        w.0.extend_from_slice(&0x3c00u16.to_le_bytes()); // d = 1.0
+        for j in 0..16u8 {
+            w.0.push(j | ((15 - j) << 4));
+        }
+        w.0.extend_from_slice(&0x3800u16.to_le_bytes()); // d = 0.5
+        w.0.extend_from_slice(&[0xCC; 16]);
+
+        let g = Gguf::from_bytes(w.0).unwrap();
+        // Dequant path: y = d * (q - 8).
+        let f = g.tensor_f32("w").unwrap();
+        for j in 0..16 {
+            assert_eq!(f[j], j as f32 - 8.0, "block0 low[{j}]");
+            assert_eq!(f[16 + j], (15 - j) as f32 - 8.0, "block0 high[{j}]");
+        }
+        assert!(f[32..].iter().all(|&v| v == 0.5 * (12.0 - 8.0)));
+
+        // Native path must stay packed and compute the exact same product.
+        let lin = g.linear("w", Precision::F32).unwrap();
+        match &lin {
+            Linear::KQuant(m) => {
+                assert_eq!((m.rows, m.cols), (1, 64));
+                assert_eq!(m.kind(), KQuantKind::Q40);
+                assert_eq!(m.stored_bytes(), 2 * 18); // 4.5 bits/weight
+            }
+            _ => panic!("expected Q4_0 to load natively packed"),
+        }
+        let x: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin()).collect();
+        let want: f32 = x.iter().zip(&f).map(|(a, b)| a * b).sum();
+        assert!((lin.apply(&x)[0] - want).abs() < 1e-4);
     }
 
     #[test]

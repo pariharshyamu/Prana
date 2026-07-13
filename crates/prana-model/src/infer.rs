@@ -17,8 +17,14 @@ pub struct KvCache {
 
 impl KvCache {
     pub fn new(model: &Model) -> Self {
+        Self::with_len(model, model.config.seq_len)
+    }
+
+    /// Cache sized for `positions` tokens. Modern models declare 32k+
+    /// contexts; a short generation shouldn't pay for cache it never fills.
+    pub fn with_len(model: &Model, positions: usize) -> Self {
         let c = &model.config;
-        let per_layer = c.seq_len * c.kv_dim();
+        let per_layer = positions.min(c.seq_len) * c.kv_dim();
         Self {
             k: (0..c.n_layers).map(|_| vec![0f32; per_layer]).collect(),
             v: (0..c.n_layers).map(|_| vec![0f32; per_layer]).collect(),
@@ -42,7 +48,7 @@ pub fn forward(model: &Model, cache: &mut KvCache, token: u32, pos: usize) -> Ve
     let head_dim = c.head_dim;
     let kv_dim = c.kv_dim();
 
-    let mut x = model.tok_emb[token as usize * dim..(token as usize + 1) * dim].to_vec();
+    let mut x = model.tok_emb.row(token as usize, dim);
     if c.emb_scale != 1.0 {
         for v in x.iter_mut() {
             *v *= c.emb_scale;
@@ -102,21 +108,22 @@ pub struct GenStats {
 }
 
 /// Generate up to `steps` tokens continuing `prompt`, streaming each decoded
-/// piece to `on_piece`. Stops on the tokenizer's stop tokens or the model's
-/// context limit.
+/// piece to `on_piece` (second arg is true while the piece belongs to the
+/// prompt prefill — chat UIs hide those). Stops on the tokenizer's stop
+/// tokens or the model's context limit.
 pub fn generate(
     model: &Model,
     tokenizer: &dyn Tokenize,
     prompt: &str,
     steps: usize,
     sampler: &mut crate::sampler::Sampler,
-    mut on_piece: impl FnMut(&[u8]),
+    mut on_piece: impl FnMut(&[u8], bool),
 ) -> GenStats {
     let prompt_tokens = tokenizer.encode_prompt(prompt);
     assert!(!prompt_tokens.is_empty(), "prompt encoded to zero tokens");
     let max_pos = model.config.seq_len.min(prompt_tokens.len() + steps);
 
-    let mut cache = KvCache::new(model);
+    let mut cache = KvCache::with_len(model, max_pos);
     let start = std::time::Instant::now();
     let mut token = prompt_tokens[0];
     let mut generated = 0usize;
@@ -137,7 +144,7 @@ pub fn generate(
             }
             generated += 1;
         }
-        on_piece(&tokenizer.decode(token, next));
+        on_piece(&tokenizer.decode(token, next), pos + 1 < prompt_tokens.len());
         token = next;
     }
 

@@ -107,6 +107,39 @@ impl Linear {
     }
 }
 
+/// The `[vocab_size, dim]` token-embedding table. GGUF stores it quantized
+/// (Q4_0 in a q4_0 file is 136M of a 0.5B model's parameters); keeping the
+/// packed blocks and dequantizing one row per lookup costs microseconds a
+/// token and saves the table's f32 expansion (~500 MiB for a 152k vocab).
+pub enum Embedding {
+    F32(Vec<f32>),
+    KQuant(KQuantMatrix),
+}
+
+impl Embedding {
+    /// Dequantize the embedding row for one token.
+    pub fn row(&self, token: usize, dim: usize) -> Vec<f32> {
+        match self {
+            Embedding::F32(w) => w[token * dim..(token + 1) * dim].to_vec(),
+            Embedding::KQuant(m) => m.dequantize_row(token),
+        }
+    }
+
+    pub fn n_values(&self) -> usize {
+        match self {
+            Embedding::F32(w) => w.len(),
+            Embedding::KQuant(m) => m.rows * m.cols,
+        }
+    }
+
+    pub fn stored_bytes(&self) -> usize {
+        match self {
+            Embedding::F32(w) => w.len() * 4,
+            Embedding::KQuant(m) => m.stored_bytes(),
+        }
+    }
+}
+
 /// Per-layer weights.
 pub struct Layer {
     pub rms_att: Vec<f32>,
@@ -127,8 +160,8 @@ pub struct Layer {
 /// A loaded model.
 pub struct Model {
     pub config: Config,
-    /// `[vocab_size, dim]` token embedding table, always f32 (row lookups).
-    pub tok_emb: Vec<f32>,
+    /// `[vocab_size, dim]` token embedding table (rows dequantized on lookup).
+    pub tok_emb: Embedding,
     pub layers: Vec<Layer>,
     pub rms_final: Vec<f32>,
     /// LM head; `None` means classifier shares `tok_emb`.
@@ -156,9 +189,13 @@ impl Model {
 
     /// Compute vocabulary logits for the final hidden state.
     pub fn logits(&self, x: &[f32]) -> Vec<f32> {
-        match &self.wcls {
-            Some(c) => c.apply(x),
-            None => matmul_f32(x, &self.tok_emb, 1, self.config.dim, self.config.vocab_size),
+        match (&self.wcls, &self.tok_emb) {
+            (Some(c), _) => c.apply(x),
+            (None, Embedding::F32(w)) => {
+                matmul_f32(x, w, 1, self.config.dim, self.config.vocab_size)
+            }
+            // Tied classifier over a quantized table runs the native kernel.
+            (None, Embedding::KQuant(m)) => matmul_kquant_f32(x, m, 1),
         }
     }
 }
@@ -263,6 +300,7 @@ pub fn load_bytes(data: &[u8], precision: Precision) -> io::Result<Model> {
         }
         _ => wcls,
     };
+    let tok_emb = Embedding::F32(tok_emb);
 
     let (mut rms_att, mut wq, mut wk, mut wv) = (rms_att.into_iter(), wq.into_iter(), wk.into_iter(), wv.into_iter());
     let (mut wo, mut rms_ffn, mut w1, mut w2, mut w3) =

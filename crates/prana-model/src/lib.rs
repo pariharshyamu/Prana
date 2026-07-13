@@ -131,7 +131,7 @@ mod tests {
 
         let mut sampler = Sampler::new(0.0, 1);
         let mut streamed = Vec::new();
-        let stats = generate(&model, &tok, "ab", 64, &mut sampler, |piece| {
+        let stats = generate(&model, &tok, "ab", 64, &mut sampler, |piece, _| {
             streamed.extend_from_slice(piece);
         });
         // Context is 16: prompt (BOS + " " + 'a' + 'b' = 4 tokens) + generation

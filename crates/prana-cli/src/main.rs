@@ -34,8 +34,9 @@ fn main() {
 }
 
 /// Generate text with a real model. Usage:
-/// `prana run [model.bin tokenizer.bin | model.gguf] [prompt] [--steps N] [--temp T] [--q8]`
-/// (GGUF files embed their tokenizer, so no tokenizer argument is needed.)
+/// `prana run [model.bin tokenizer.bin | model.gguf] [prompt] [--steps N] [--temp T] [--q8] [--chat]`
+/// (GGUF files embed their tokenizer, so no tokenizer argument is needed.
+/// `--chat` wraps the prompt in the ChatML template instruct models expect.)
 fn run() {
     use prana_model::{checkpoint, gguf, Precision, Sampler, Tokenizer};
     use std::io::Write;
@@ -46,6 +47,7 @@ fn run() {
     let mut temp = 0.8f32;
     let mut seed = 20260712u64;
     let mut precision = Precision::F32;
+    let mut chat_mode = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -53,6 +55,7 @@ fn run() {
             "--temp" => temp = it.next().and_then(|v| v.parse().ok()).unwrap_or(temp),
             "--seed" => seed = it.next().and_then(|v| v.parse().ok()).unwrap_or(seed),
             "--q8" => precision = Precision::Q8,
+            "--chat" => chat_mode = true,
             v => positional.push(v.to_string()),
         }
     }
@@ -97,19 +100,34 @@ fn run() {
         c.dim, c.n_layers, c.n_heads, c.n_kv_heads, c.vocab_size, c.seq_len
     );
     println!(
-        "  precision         : {:?}  ({:.1} MiB of projection weights)",
+        "  precision         : {:?}  ({:.1} MiB projections + {:.1} MiB embedding table)",
         precision,
-        model.projection_bytes() as f64 / (1024.0 * 1024.0)
+        model.projection_bytes() as f64 / (1024.0 * 1024.0),
+        model.tok_emb.stored_bytes() as f64 / (1024.0 * 1024.0)
     );
     println!("  load time         : {:.2}s", t_load.elapsed().as_secs_f64());
     println!("  sampler           : temp={temp} seed={seed}   steps={steps}\n");
     println!("---");
 
-    // The stream includes the prompt's own pieces as they are prefilled.
+    // ChatML is the template the Qwen-family instruct models are trained on.
+    // The special markers encode verbatim via the tokenizer's control tokens.
+    let prompt = if chat_mode {
+        format!(
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+             <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        )
+    } else {
+        prompt
+    };
+
+    // Completion mode echoes the prompt as it prefills; chat mode hides the
+    // template and shows only the assistant's reply.
     let mut sampler = Sampler::new(temp, seed);
-    let stats = prana_model::generate(&model, tokenizer.as_ref(), &prompt, steps, &mut sampler, |piece| {
-        std::io::stdout().write_all(piece).ok();
-        std::io::stdout().flush().ok();
+    let stats = prana_model::generate(&model, tokenizer.as_ref(), &prompt, steps, &mut sampler, |piece, is_prompt| {
+        if !(chat_mode && is_prompt) {
+            std::io::stdout().write_all(piece).ok();
+            std::io::stdout().flush().ok();
+        }
     });
     println!("\n---\n");
     println!(

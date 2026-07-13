@@ -33,8 +33,9 @@ mod threading;
 
 pub use attention::{attention, attention_decode, rope, rope_interleaved, rope_neox};
 pub use kquant::{
-    dequant_q4k_block, dequant_q6k_block, matmul_kquant_f32, q4k_scale_min, KQuantKind,
-    KQuantMatrix, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, QK_K,
+    dequant_q40_block, dequant_q4k_block, dequant_q6k_block, matmul_kquant_f32, q4k_scale_min,
+    KQuantKind, KQuantMatrix, Q4_0_BLOCK, Q4_0_BLOCK_BYTES, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
+    QK_K,
 };
 pub use matmul::{dequantize_q8, matmul_f32, matmul_q8_f32, quantize_q8, QuantMatrix, Q8_BLOCK};
 pub use norms::{gelu_tanh, rmsnorm, silu, softmax};

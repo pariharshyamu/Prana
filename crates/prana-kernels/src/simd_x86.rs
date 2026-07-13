@@ -93,6 +93,46 @@ mod imp {
         }
     }
 
+    /// AVX2+FMA native Q4_0 row dot over packed 18-byte blocks.
+    /// `asums[g]` must hold the activation sum of 32-group `g`:
+    /// `Σ a·d(q−8) = d·(Σ a·q − 8·Σ a)`.
+    ///
+    /// # Safety
+    /// Caller must ensure the CPU supports AVX2+FMA (see [`available`]).
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_q40(a: &[f32], row: &[u8], asums: &[f32]) -> f32 {
+        use crate::kquant::{Q4_0_BLOCK, Q4_0_BLOCK_BYTES};
+        debug_assert_eq!(row.len() % Q4_0_BLOCK_BYTES, 0);
+        debug_assert_eq!(a.len(), row.len() / Q4_0_BLOCK_BYTES * Q4_0_BLOCK);
+        debug_assert_eq!(asums.len(), row.len() / Q4_0_BLOCK_BYTES);
+
+        let mut total = 0f32;
+        // SAFETY: per block we load 16 quant bytes at offset 2 of an 18-byte
+        // block and 32 activations of a's matching window, in-bounds by the
+        // debug-checked length relations; loadu tolerates unaligned addresses.
+        unsafe {
+            let nib_mask = _mm_set1_epi8(0x0F);
+            for (i, b) in row.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+                let d = crate::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                let a_blk = a.as_ptr().add(i * Q4_0_BLOCK);
+                let bytes = _mm_loadu_si128(b.as_ptr().add(2) as *const __m128i);
+                let lo = _mm_and_si128(bytes, nib_mask); // elements 0..16
+                let hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), nib_mask); // 16..32
+                let mut acc = _mm256_setzero_ps();
+                for j in 0..2 {
+                    let lo8 = if j == 0 { lo } else { _mm_srli_si128(lo, 8) };
+                    let hi8 = if j == 0 { hi } else { _mm_srli_si128(hi, 8) };
+                    let lo_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo8));
+                    let hi_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi8));
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(a_blk.add(j * 8)), lo_f, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(a_blk.add(16 + j * 8)), hi_f, acc);
+                }
+                total += d * (hsum(acc) - 8.0 * asums[i]);
+            }
+        }
+        total
+    }
+
     /// AVX2+FMA native Q4_K row dot over packed 144-byte super-blocks.
     /// `asums[g]` must hold the activation sum of 32-group `g` (the affine
     /// `−dmin·m` term needs only Σa, not the per-element products).
@@ -173,9 +213,14 @@ mod imp {
     pub unsafe fn dot_q4k(_a: &[f32], _row: &[u8], _asums: &[f32]) -> f32 {
         unreachable!("simd tier unavailable on this target")
     }
+    /// # Safety
+    /// Never callable: `available()` is always false on this target.
+    pub unsafe fn dot_q40(_a: &[f32], _row: &[u8], _asums: &[f32]) -> f32 {
+        unreachable!("simd tier unavailable on this target")
+    }
 }
 
-pub use imp::{available, dot_f32, dot_q4k, dot_q8};
+pub use imp::{available, dot_f32, dot_q40, dot_q4k, dot_q8};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {

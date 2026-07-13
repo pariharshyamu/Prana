@@ -47,6 +47,10 @@ pub struct BpeTokenizer {
     bos_id: Option<u32>,
     eos_id: Option<u32>,
     add_bos: bool,
+    /// Control/special tokens (`<|im_start|>`, ...) matched verbatim before
+    /// pre-tokenization, longest first. Stored raw in the vocab (not
+    /// byte-mapped), so they must bypass the BPE path entirely.
+    specials: Vec<(String, u32)>,
 }
 
 impl BpeTokenizer {
@@ -70,7 +74,19 @@ impl BpeTokenizer {
         }
         let byte_enc = bytes_to_unicode();
         let byte_dec = byte_enc.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect();
-        Self { vocab, lookup, ranks, byte_enc, byte_dec, bos_id, eos_id, add_bos }
+        Self { vocab, lookup, ranks, byte_enc, byte_dec, bos_id, eos_id, add_bos, specials: Vec::new() }
+    }
+
+    /// Register special tokens (from GGUF `tokenizer.ggml.token_type`).
+    pub fn with_specials(mut self, mut specials: Vec<(String, u32)>) -> Self {
+        specials.sort_by_key(|s| std::cmp::Reverse(s.0.len())); // longest match wins
+        self.specials = specials;
+        self
+    }
+
+    /// Look up a token id by its literal vocab string (e.g. `<|im_start|>`).
+    pub fn token_id(&self, piece: &str) -> Option<u32> {
+        self.lookup.get(piece).copied()
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -161,8 +177,24 @@ impl Tokenize for BpeTokenizer {
                 out.push(b);
             }
         }
-        for piece in Self::pre_tokenize(text) {
-            out.extend(self.bpe_piece(&piece));
+        // Specials are matched verbatim before BPE sees the text; `specials`
+        // is sorted longest-first, so ties at one position take the longest.
+        let mut rest = text;
+        while !rest.is_empty() {
+            let hit = self
+                .specials
+                .iter()
+                .filter_map(|(s, id)| rest.find(s.as_str()).map(|at| (at, s.len(), *id)))
+                .min_by_key(|&(at, _, _)| at);
+            let (plain, special, tail) = match hit {
+                Some((at, len, id)) => (&rest[..at], Some(id), &rest[at + len..]),
+                None => (rest, None, ""),
+            };
+            for piece in Self::pre_tokenize(plain) {
+                out.extend(self.bpe_piece(&piece));
+            }
+            out.extend(special);
+            rest = tail;
         }
         out
     }
@@ -228,5 +260,16 @@ mod tests {
     fn pre_tokenizer_keeps_leading_spaces_on_words() {
         let pieces = BpeTokenizer::pre_tokenize("hello world 42!");
         assert_eq!(pieces, vec!["hello", " world", " 42", "!"]);
+    }
+
+    #[test]
+    fn special_tokens_encode_verbatim_not_split() {
+        let t = tiny().with_specials(vec![("<|endoftext|>".to_string(), 5)]);
+        // The special must come out as one id, with normal BPE around it.
+        assert_eq!(t.encode_prompt("hi<|endoftext|> hi"), vec![3, 5, 4]);
+        assert_eq!(t.encode_prompt("<|endoftext|>"), vec![5]);
+        // Without registration the same text falls through to byte BPE
+        // (and here mostly drops: tiny vocab lacks '<', '|', ...).
+        assert_ne!(tiny().encode_prompt("hi<|endoftext|> hi"), vec![3, 5, 4]);
     }
 }

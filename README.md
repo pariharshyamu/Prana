@@ -48,7 +48,7 @@ boundary marked `#![forbid(unsafe_code)]`:
 | [`prana-kernels`](crates/prana-kernels) | `matmul` / `quants` / `norms_rope` / `attention` / `threading` | Q8 quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, scoped-thread `parallel_for` |
 | [`prana-graph`](crates/prana-graph) | `CactusGraph` | checked-handle, shape-validating, define-then-run graph |
 | [`prana-cactus`](crates/prana-cactus) | `bindings/rust/cactus.rs` + `cactus_engine.h` | **Phase 0**: safe RAII wrapper over the real Cactus C ABI — `Result` errors, streaming-callback trampoline with panic containment, grow-and-retry buffers; testable everywhere via an in-process mock of the ABI |
-| [`prana-model`](crates/prana-model) | `cactus-engine` model loading / tokenizer / sampling | **real-model inference**: llama2.c *and GGUF* loaders for **llama, qwen2, and gemma** architectures (F32/F16/Q8_0/Q4_K/Q6_K, all quantized types running natively in packed form), SentencePiece *and* GPT-2 byte-level BPE tokenizers (file or GGUF-embedded), KV-cached forward pass with QKV biases / NeoX RoPE / GELU / decoupled head_dim, greedy/temperature sampling — zero `unsafe`, zero deps |
+| [`prana-model`](crates/prana-model) | `cactus-engine` model loading / tokenizer / sampling | **real-model inference**: llama2.c *and GGUF* loaders for **llama, qwen2, and gemma** architectures (F32/F16/Q4_0/Q8_0/Q4_K/Q6_K, all quantized types running natively in packed form, embedding rows dequantized per lookup), SentencePiece *and* GPT-2 byte-level BPE tokenizers with control/special tokens, ChatML chat mode, KV-cached forward pass with QKV biases / NeoX RoPE / GELU / decoupled head_dim, greedy/temperature sampling — zero `unsafe`, zero deps |
 | [`prana-cli`](crates/prana-cli) | `cactus run` / `benchmark` / `chat` | real-model text generation (`run`), transformer-block demo, microbenchmark, Phase 0 chat driver |
 
 ### Run it
@@ -69,14 +69,20 @@ cargo run --release -p prana-cli -- run models/stories15M.gguf "Once upon a time
 # K-quants: build a Q4_K/Q6_K mixture file (Q4_K_M-style) and run it
 python3 scripts/convert-to-gguf.py models/stories15M.bin models/tokenizer.bin models/stories15M-q4km.gguf q4km
 cargo run --release -p prana-cli -- run models/stories15M-q4km.gguf "Once upon a time"
+
+# An off-the-shelf instruct model (any qwen2-arch q4_0/q8_0/q4_k_m GGUF):
+cargo run --release -p prana-cli -- run qwen2.5-0.5b-instruct-q4_0.gguf "Who are you?" --chat
 ```
 
 `prana run` options: `[model.bin tokenizer.bin | model.gguf] [prompt]
-[--steps N] [--temp T] [--seed S] [--q8]`. With `--temp 0` (greedy) the output
-is token-identical to llama2.c's reference output for the same checkpoint —
-via both container formats — which is the correctness check for the whole
-pipeline (tokenizer, RoPE convention, attention, SwiGLU, SIMD kernels). The
-AVX2+FMA SIMD tier engages automatically when the CPU supports it.
+[--steps N] [--temp T] [--seed S] [--q8] [--chat]`. With `--temp 0` (greedy)
+the output is token-identical to llama2.c's reference output for the same
+checkpoint — via both container formats — which is the correctness check for
+the whole pipeline (tokenizer, RoPE convention, attention, SwiGLU, SIMD
+kernels). The AVX2+FMA SIMD tier engages automatically when the CPU supports
+it. `--chat` wraps the prompt in the ChatML template instruct models are
+trained on (the `<|im_start|>` markers encode via the tokenizer's control
+tokens and generation stops at `<|im_end|>`).
 
 To bind `prana-cactus` against the real engine instead of the mock, build
 `libcactus_engine.a` on an ARM/Apple host (`cactus-engine/build.sh` in the
@@ -115,15 +121,20 @@ It also implements **Phase 0 of the migration plan**: `prana-cactus`, a safe
 idiomatic wrapper over the engine's real C ABI, exercised against an
 in-process mock of that ABI (the native static lib is ARM/Metal-only).
 **Architecture support:** llama-family plus **Qwen2** (QKV biases, NeoX RoPE,
-GPT-2 BPE tokenizer from GGUF merges) and **Gemma** ((1+w) RMSNorm folded at
-load, √dim embedding scale, tanh-GELU MLP, decoupled head_dim). Every model
-host reachable from this environment is egress-blocked, so Qwen2/Gemma are
-verified with synthetic GGUF fixtures (loader knobs, bias effects, norm
-folding, finite deterministic forward passes) rather than real weights — the
-llama path is the one verified token-identical against a reference
-implementation. K-quant tensors (Q4_K/Q6_K) run **natively in packed form**
-(4.5/6.6 bits per weight in RAM) with the AVX2 tier; native dots are
-parity-tested against dequantized dense matmuls.
+GPT-2 BPE tokenizer with control/special tokens from GGUF metadata) and
+**Gemma** ((1+w) RMSNorm folded at load, √dim embedding scale, tanh-GELU MLP,
+decoupled head_dim). The Qwen2 path is **verified on real weights**: an
+off-the-shelf `Qwen2.5-0.5B-Instruct` q4_0 GGUF loads, answers ChatML prompts
+coherently as an assistant, and stops at `<|im_end|>`; Gemma remains verified
+via synthetic GGUF fixtures (loader knobs, norm folding, finite deterministic
+forward passes), and the llama path is verified token-identical against
+llama2.c's reference output. Quantized tensors (Q4_0/Q4_K/Q6_K) run
+**natively in packed form** (4.5/6.6 bits per weight in RAM) with the AVX2
+tier — including the token-embedding table, whose rows dequantize per lookup
+instead of expanding to f32 at load — and native dots are parity-tested
+against dequantized dense matmuls. On an Intel Core Ultra 5 laptop the 0.5B
+instruct model decodes at ~31 tok/s (vs ~18 before packed-native Q4_0), with
+~410 MiB of weight memory (vs ~1.1 GiB).
 
 Still out of scope: ARM NEON/Metal targets, safetensors, further
 architectures (Phi, Gemma-2 softcapping), exact GPT-2 pre-tokenizer regex,
