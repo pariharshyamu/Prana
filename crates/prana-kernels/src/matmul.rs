@@ -29,6 +29,16 @@ pub struct QuantMatrix {
 }
 
 impl QuantMatrix {
+    /// Assemble from already-quantized parts (e.g. a GGUF Q8_0 tensor whose
+    /// blocks map 1:1 onto this layout). Panics on inconsistent lengths —
+    /// a loader bug, not a runtime input.
+    pub fn from_parts(rows: usize, cols: usize, q: Vec<i8>, scales: Vec<f32>) -> Self {
+        assert_eq!(cols % Q8_BLOCK, 0, "cols must be a multiple of {Q8_BLOCK}");
+        assert_eq!(q.len(), rows * cols);
+        assert_eq!(scales.len(), rows * (cols / Q8_BLOCK));
+        Self { rows, cols, q, scales }
+    }
+
     fn groups_per_row(&self) -> usize {
         self.cols / Q8_BLOCK
     }
@@ -171,8 +181,28 @@ where
     });
 }
 
+/// Dense dot product: SIMD tier when the CPU supports it, scalar otherwise.
 #[inline]
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    if crate::simd_x86::available() {
+        // SAFETY: available() verified AVX2+FMA support on this CPU.
+        return unsafe { crate::simd_x86::dot_f32(a, b) };
+    }
+    dot_f32_scalar(a, b)
+}
+
+/// Q8-block dot product: SIMD tier when the CPU supports it, scalar otherwise.
+#[inline]
+fn dot_q8(a: &[f32], q: &[i8], scales: &[f32]) -> f32 {
+    if crate::simd_x86::available() {
+        // SAFETY: available() verified AVX2+FMA support on this CPU.
+        return unsafe { crate::simd_x86::dot_q8(a, q, scales) };
+    }
+    dot_q8_scalar(a, q, scales)
+}
+
+#[inline]
+pub(crate) fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0f32; 4];
     let mut ai = a.chunks_exact(4);
     let mut bi = b.chunks_exact(4);
@@ -189,7 +219,7 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[inline]
-fn dot_q8(a: &[f32], q: &[i8], scales: &[f32]) -> f32 {
+pub(crate) fn dot_q8_scalar(a: &[f32], q: &[i8], scales: &[f32]) -> f32 {
     let mut sum = 0f32;
     for (g, &scale) in scales.iter().enumerate() {
         let base = g * Q8_BLOCK;

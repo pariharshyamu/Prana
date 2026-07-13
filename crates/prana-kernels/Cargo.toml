@@ -7,3 +7,8 @@ description = "SIMD-friendly compute kernels for Prana (matmul, quant, norms, so
 
 [dependencies]
 prana-tensor.workspace = true
+
+[lints.rust]
+# The SIMD fast tier (simd_x86.rs) is the one place `unsafe` is allowed, and
+# every unsafe op inside an unsafe fn must still be explicitly scoped.
+unsafe_op_in_unsafe_fn = "deny"

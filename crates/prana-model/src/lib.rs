@@ -8,6 +8,7 @@
 //! `#![forbid(unsafe_code)]`.
 
 pub mod checkpoint;
+pub mod gguf;
 pub mod infer;
 pub mod sampler;
 pub mod tokenizer;

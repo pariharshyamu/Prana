@@ -34,9 +34,10 @@ fn main() {
 }
 
 /// Generate text with a real model. Usage:
-/// `prana run [model.bin] [tokenizer.bin] [prompt] [--steps N] [--temp T] [--q8]`
+/// `prana run [model.bin tokenizer.bin | model.gguf] [prompt] [--steps N] [--temp T] [--q8]`
+/// (GGUF files embed their tokenizer, so no tokenizer argument is needed.)
 fn run() {
-    use prana_model::{checkpoint, Precision, Sampler, Tokenizer};
+    use prana_model::{checkpoint, gguf, Precision, Sampler, Tokenizer};
     use std::io::Write;
 
     let args: Vec<String> = std::env::args().skip(2).collect();
@@ -56,24 +57,39 @@ fn run() {
         }
     }
     let model_path = positional.first().cloned().unwrap_or_else(|| "models/stories15M.bin".into());
-    let tok_path = positional.get(1).cloned().unwrap_or_else(|| "models/tokenizer.bin".into());
-    let prompt = positional.get(2).cloned().unwrap_or_else(|| "Once upon a time".into());
+    let is_gguf = model_path.ends_with(".gguf");
+    // GGUF embeds its tokenizer, so positionals shift left by one.
+    let tok_path = if is_gguf { None } else { Some(positional.get(1).cloned().unwrap_or_else(|| "models/tokenizer.bin".into())) };
+    let prompt_idx = if is_gguf { 1 } else { 2 };
+    let prompt = positional.get(prompt_idx).cloned().unwrap_or_else(|| "Once upon a time".into());
 
     println!("== Prana run: real-model inference on safe Rust kernels ==\n");
     let t_load = std::time::Instant::now();
-    let model = match checkpoint::load(std::path::Path::new(&model_path), precision) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("cannot load '{model_path}': {e}");
-            eprintln!("hint: fetch the model first — see scripts/fetch-model.sh");
-            std::process::exit(1);
+    let (model, tokenizer) = if is_gguf {
+        match gguf::load(std::path::Path::new(&model_path), precision) {
+            Ok(mt) => mt,
+            Err(e) => {
+                eprintln!("cannot load '{model_path}': {e}");
+                std::process::exit(1);
+            }
         }
+    } else {
+        let model = match checkpoint::load(std::path::Path::new(&model_path), precision) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("cannot load '{model_path}': {e}");
+                eprintln!("hint: fetch the model first — see scripts/fetch-model.sh");
+                std::process::exit(1);
+            }
+        };
+        let tok_path = tok_path.unwrap();
+        let tokenizer = Tokenizer::load(std::path::Path::new(&tok_path), model.config.vocab_size)
+            .unwrap_or_else(|e| {
+                eprintln!("cannot load tokenizer '{tok_path}': {e}");
+                std::process::exit(1);
+            });
+        (model, tokenizer)
     };
-    let tokenizer = Tokenizer::load(std::path::Path::new(&tok_path), model.config.vocab_size)
-        .unwrap_or_else(|e| {
-            eprintln!("cannot load tokenizer '{tok_path}': {e}");
-            std::process::exit(1);
-        });
 
     let c = &model.config;
     println!(

@@ -34,7 +34,7 @@ pub fn forward(model: &Model, cache: &mut KvCache, token: u32, pos: usize) -> Ve
     let dim = c.dim;
     let head_dim = c.head_dim();
     let kv_dim = c.kv_dim();
-    const ROPE_THETA: f32 = 10000.0;
+    let rope_theta = c.rope_theta;
 
     let mut x = model.tok_emb[token as usize * dim..(token as usize + 1) * dim].to_vec();
 
@@ -44,8 +44,8 @@ pub fn forward(model: &Model, cache: &mut KvCache, token: u32, pos: usize) -> Ve
         let mut q = layer.wq.apply(&xb);
         let mut k = layer.wk.apply(&xb);
         let v = layer.wv.apply(&xb);
-        rope_interleaved(&mut q, pos, head_dim, ROPE_THETA);
-        rope_interleaved(&mut k, pos, head_dim, ROPE_THETA);
+        rope_interleaved(&mut q, pos, head_dim, rope_theta);
+        rope_interleaved(&mut k, pos, head_dim, rope_theta);
 
         cache.k[l][pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&k);
         cache.v[l][pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&v);

@@ -12,17 +12,21 @@
 //!    written in a shape LLVM reliably turns into SIMD (`chunks_exact`,
 //!    accumulator arrays, no aliasing). No `unsafe`, portable to every target,
 //!    and already within a small constant factor of hand-tuned code.
-//! 2. **Fast tier — small, audited `unsafe`.** For a production build the same
-//!    kernel signatures get a target-gated intrinsics implementation (NEON on
-//!    ARM, AVX on x86). That `unsafe` surface is a few hundred lines, not tens
-//!    of thousands, because everything above the kernel boundary is safe.
+//! 2. **Fast tier — small, audited `unsafe`.** The same kernel signatures get
+//!    a target-gated intrinsics implementation, selected at runtime. This
+//!    ships today for x86-64 (`simd_x86.rs`: AVX2+FMA dot products, ~100 lines
+//!    of commented `unsafe`); an aarch64 NEON twin slots in beside it the same
+//!    way. That `unsafe` surface is a few hundred lines, not tens of
+//!    thousands, because everything above the kernel boundary is safe.
 //!
-//! This file ships tier 1 so the prototype builds and runs on any host,
-//! including the x86_64 CI box this was developed on.
+//! Tier 1 keeps the prototype correct and portable everywhere; tier 2 is used
+//! automatically wherever the CPU supports it, and every SIMD kernel is tested
+//! for parity against its scalar twin.
 
 mod attention;
 mod matmul;
 mod norms;
+mod simd_x86;
 mod threading;
 
 pub use attention::{attention, attention_decode, rope, rope_interleaved};

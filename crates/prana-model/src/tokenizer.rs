@@ -28,6 +28,17 @@ impl Tokenizer {
         Self::from_bytes(&fs::read(path)?, vocab_size)
     }
 
+    /// Build directly from piece/score lists (e.g. GGUF's embedded
+    /// `tokenizer.ggml.tokens` / `.scores` metadata arrays).
+    pub fn from_parts(vocab: Vec<Vec<u8>>, scores: Vec<f32>) -> Self {
+        assert_eq!(vocab.len(), scores.len());
+        let mut lookup = HashMap::with_capacity(vocab.len());
+        for (id, piece) in vocab.iter().enumerate() {
+            lookup.entry(piece.clone()).or_insert(id as u32);
+        }
+        Self { vocab, scores, lookup }
+    }
+
     /// Parse the tokenizer.bin layout: `u32 max_token_length`, then
     /// `vocab_size ×  (f32 score, u32 len, len bytes)`.
     pub fn from_bytes(data: &[u8], vocab_size: usize) -> io::Result<Self> {
@@ -44,11 +55,7 @@ impl Tokenizer {
             vocab.push(bytes.to_vec());
             off += 8 + len;
         }
-        let mut lookup = HashMap::with_capacity(vocab_size);
-        for (id, piece) in vocab.iter().enumerate() {
-            lookup.entry(piece.clone()).or_insert(id as u32);
-        }
-        Ok(Self { vocab, scores, lookup })
+        Ok(Self::from_parts(vocab, scores))
     }
 
     pub fn vocab_size(&self) -> usize {

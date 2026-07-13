@@ -26,6 +26,9 @@ pub struct Config {
     pub seq_len: usize,
     /// Classifier shares the token-embedding matrix (header vocab_size > 0).
     pub shared_classifier: bool,
+    /// RoPE frequency base (10000 for llama2.c models; GGUF metadata may
+    /// override, e.g. long-context fine-tunes).
+    pub rope_theta: f32,
 }
 
 impl Config {
@@ -52,7 +55,7 @@ pub enum Linear {
 }
 
 impl Linear {
-    fn new(w: Vec<f32>, rows: usize, cols: usize, precision: Precision) -> Self {
+    pub(crate) fn new(w: Vec<f32>, rows: usize, cols: usize, precision: Precision) -> Self {
         match precision {
             // Q8 needs cols % block == 0; fall back to dense for odd shapes.
             Precision::Q8 if cols.is_multiple_of(Q8_BLOCK) => Linear::Q8(quantize_q8(rows, cols, &w)),
@@ -186,6 +189,7 @@ pub fn load_bytes(data: &[u8], precision: Precision) -> io::Result<Model> {
         vocab_size,
         seq_len,
         shared_classifier,
+        rope_theta: 10000.0,
     };
     if dim == 0 || n_heads == 0 || !dim.is_multiple_of(n_heads) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad checkpoint header"));
