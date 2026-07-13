@@ -17,10 +17,14 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use prana_kernels::{QuantMatrix, Q8_BLOCK};
+use prana_kernels::{
+    dequant_q4k_block, dequant_q6k_block, KQuantKind, KQuantMatrix, QuantMatrix,
+    Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_BLOCK, QK_K,
+};
+pub use prana_kernels::f16_to_f32;
 
-use crate::checkpoint::{Config, Layer, Linear, Model, Precision};
-use crate::tokenizer::Tokenizer;
+use crate::checkpoint::{Activation, Config, Layer, Linear, Model, Precision};
+use crate::tokenizer::{AnyTokenizer, Tokenizer};
 
 const MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
 
@@ -31,14 +35,6 @@ const GGML_Q8_0: u32 = 8;
 const GGML_Q4_K: u32 = 12;
 const GGML_Q6_K: u32 = 14;
 
-/// K-quant super-block size.
-const QK_K: usize = 256;
-/// Q4_K super-block: f16 d + f16 dmin + 12 bytes of 6-bit scales/mins + 128
-/// bytes of 4-bit quants.
-const Q4_K_BLOCK_BYTES: usize = 2 + 2 + 12 + QK_K / 2;
-/// Q6_K super-block: 128 bytes low nibbles + 64 bytes high bits + 16 i8
-/// scales + f16 d.
-const Q6_K_BLOCK_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
 
 fn err(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -141,91 +137,6 @@ struct TensorInfo {
     dims: Vec<usize>,
     ggml_type: u32,
     offset: usize,
-}
-
-/// IEEE 754 half → single conversion (handles subnormals, inf, NaN).
-pub fn f16_to_f32(h: u16) -> f32 {
-    let sign = ((h >> 15) & 1) as u32;
-    let exp = ((h >> 10) & 0x1f) as u32;
-    let frac = (h & 0x3ff) as u32;
-    let bits = match (exp, frac) {
-        (0, 0) => sign << 31,
-        // subnormal: exact value is frac * 2^-24 (sign applied numerically)
-        (0, f) => {
-            let v = f as f32 * 2f32.powi(-24);
-            return if sign == 1 { -v } else { v };
-        }
-        (0x1f, 0) => (sign << 31) | 0x7f80_0000,
-        (0x1f, f) => (sign << 31) | 0x7f80_0000 | (f << 13),
-        (e, f) => (sign << 31) | ((e + 127 - 15) << 23) | (f << 13),
-    };
-    f32::from_bits(bits)
-}
-
-/// Unpack the 6-bit (scale, min) pair `j` (0..8) from a Q4_K super-block's
-/// 12-byte packed `scales` field — llama.cpp's `get_scale_min_k4`.
-fn q4k_scale_min(j: usize, s: &[u8]) -> (f32, f32) {
-    if j < 4 {
-        ((s[j] & 63) as f32, (s[j + 4] & 63) as f32)
-    } else {
-        (
-            ((s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4)) as f32,
-            ((s[j + 4] >> 4) | ((s[j] >> 6) << 4)) as f32,
-        )
-    }
-}
-
-/// Dequantize one Q4_K super-block (144 bytes -> 256 f32), llama.cpp
-/// `dequantize_row_q4_K`: eight 32-wide groups, each `d*sc*(q) - dmin*m`,
-/// where groups (2g, 2g+1) share 32 bytes as (low nibbles, high nibbles).
-fn dequant_q4k_block(b: &[u8], out: &mut Vec<f32>) {
-    let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
-    let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
-    let scales = &b[4..16];
-    let qs = &b[16..16 + QK_K / 2];
-    for pair in 0..4 {
-        let q = &qs[pair * 32..(pair + 1) * 32];
-        let (sc1, m1) = q4k_scale_min(pair * 2, scales);
-        let (sc2, m2) = q4k_scale_min(pair * 2 + 1, scales);
-        let (d1, min1) = (d * sc1, dmin * m1);
-        let (d2, min2) = (d * sc2, dmin * m2);
-        for &byte in q {
-            out.push(d1 * (byte & 0xF) as f32 - min1);
-        }
-        for &byte in q {
-            out.push(d2 * (byte >> 4) as f32 - min2);
-        }
-    }
-}
-
-/// Dequantize one Q6_K super-block (210 bytes -> 256 f32), llama.cpp
-/// `dequantize_row_q6_K`: 6-bit values assembled from a low nibble plus 2
-/// high bits, minus 32, times `d * scales[sub-block]`.
-fn dequant_q6k_block(b: &[u8], out: &mut Vec<f32>) {
-    let ql = &b[0..128];
-    let qh = &b[128..192];
-    let sc = &b[192..208];
-    let d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
-    let scale = |i: usize| d * sc[i] as i8 as f32;
-    let start = out.len();
-    out.resize(start + QK_K, 0.0);
-    let y = &mut out[start..start + QK_K];
-    // Each 128-value half decodes four interleaved 32-wide groups: value l of
-    // group g lands at y[half*128 + g*32 + l].
-    for half in 0..2 {
-        let (ql, qh, s0, yo) = (&ql[half * 64..], &qh[half * 32..], half * 8, half * 128);
-        for l in 0..32 {
-            let is = s0 + l / 16;
-            let q1 = (((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i8 - 32) as f32;
-            let q2 = (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32) as f32;
-            let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32) as f32;
-            let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32) as f32;
-            y[yo + l] = scale(is) * q1;
-            y[yo + l + 32] = scale(is + 2) * q2;
-            y[yo + l + 64] = scale(is + 4) * q3;
-            y[yo + l + 96] = scale(is + 6) * q4;
-        }
-    }
 }
 
 /// The parsed file: metadata + tensor directory + the raw data section.
@@ -362,6 +273,14 @@ impl Gguf {
             }
             return Ok(Linear::Q8(QuantMatrix::from_parts(rows, cols, q, scales)));
         }
+        // K-quant tensors likewise stay packed and run on the native
+        // K-quant matmul (4.5 / 6.6 bits per weight in RAM).
+        if matches!(info.ggml_type, GGML_Q4_K | GGML_Q6_K) && cols.is_multiple_of(QK_K) {
+            let kind = if info.ggml_type == GGML_Q4_K { KQuantKind::Q4K } else { KQuantKind::Q6K };
+            let blocks = rows * cols / QK_K;
+            let raw = self.raw(info, blocks * kind.block_bytes())?.to_vec();
+            return Ok(Linear::KQuant(KQuantMatrix::from_raw(rows, cols, kind, raw)));
+        }
         Ok(Linear::new(self.tensor_f32(name)?, rows, cols, precision))
     }
 
@@ -373,79 +292,94 @@ impl Gguf {
     }
 }
 
-/// Load a GGUF llama model plus its embedded tokenizer.
-pub fn load(path: &Path, precision: Precision) -> io::Result<(Model, Tokenizer)> {
+/// Load a GGUF model (llama, qwen2, or gemma architecture) plus its
+/// embedded tokenizer.
+pub fn load(path: &Path, precision: Precision) -> io::Result<(Model, AnyTokenizer)> {
     let g = Gguf::read(path)?;
 
     let arch = match g.metadata.get("general.architecture") {
         Some(Value::Str(s)) => String::from_utf8_lossy(s).into_owned(),
         _ => return Err(err("missing general.architecture")),
     };
-    if arch != "llama" {
-        return Err(err(format!("unsupported architecture '{arch}' (only llama)")));
+    if !matches!(arch.as_str(), "llama" | "qwen2" | "gemma") {
+        return Err(err(format!("unsupported architecture '{arch}' (llama, qwen2, gemma)")));
     }
+    let is_gemma = arch == "gemma";
 
-    let dim = g.meta_usize("llama.embedding_length")?;
-    let n_layers = g.meta_usize("llama.block_count")?;
-    let n_heads = g.meta_usize("llama.attention.head_count")?;
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    let dim = g.meta_usize(&key("embedding_length"))?;
+    let n_layers = g.meta_usize(&key("block_count"))?;
+    let n_heads = g.meta_usize(&key("attention.head_count"))?;
     let n_kv_heads = g
         .metadata
-        .get("llama.attention.head_count_kv")
+        .get(&key("attention.head_count_kv"))
         .and_then(Value::as_usize)
         .unwrap_or(n_heads);
-    let hidden_dim = g.meta_usize("llama.feed_forward_length")?;
-    let seq_len = g.meta_usize("llama.context_length")?;
+    let hidden_dim = g.meta_usize(&key("feed_forward_length"))?;
+    let seq_len = g.meta_usize(&key("context_length"))?;
     let rope_theta = g
         .metadata
-        .get("llama.rope.freq_base")
+        .get(&key("rope.freq_base"))
         .and_then(Value::as_f32)
         .unwrap_or(10000.0);
+    // Gemma decouples per-head width from dim/n_heads.
+    let head_dim = g
+        .metadata
+        .get(&key("attention.key_length"))
+        .and_then(Value::as_usize)
+        .unwrap_or(dim / n_heads);
+    let norm_eps = g
+        .metadata
+        .get(&key("attention.layer_norm_rms_epsilon"))
+        .and_then(Value::as_f32)
+        .unwrap_or(1e-5);
 
-    // Tokenizer from the embedded SentencePiece vocab. GGUF stores pieces
-    // with U+2581 (▁) word markers; our tokenizer uses plain spaces.
-    let tokens = match g.metadata.get("tokenizer.ggml.tokens") {
-        Some(Value::Arr(items)) => items,
-        _ => return Err(err("missing tokenizer.ggml.tokens")),
-    };
-    let scores: Vec<f32> = match g.metadata.get("tokenizer.ggml.scores") {
-        Some(Value::Arr(items)) => items.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect(),
-        _ => vec![0.0; tokens.len()],
-    };
-    let vocab: Vec<Vec<u8>> = tokens
-        .iter()
-        .map(|v| match v {
-            Value::Str(s) => {
-                let s = String::from_utf8_lossy(s).replace('\u{2581}', " ");
-                s.into_bytes()
-            }
-            _ => Vec::new(),
-        })
-        .collect();
-    let vocab_size = vocab.len();
-    let tokenizer = Tokenizer::from_parts(vocab, scores);
+    let tokenizer = load_tokenizer(&g)?;
+    let vocab_size = tokenizer.vocab_size();
 
-    let tok_emb = g.tensor_f32("token_embd.weight")?;
+    let mut tok_emb = g.tensor_f32("token_embd.weight")?;
     if tok_emb.len() != vocab_size * dim {
         return Err(err("token_embd.weight size mismatch with vocab"));
     }
+    // llama.cpp stores gemma norm weights as (w - 1) relative to their
+    // effective value: the model computes rmsnorm(x) * (1 + w). Fold the +1
+    // in at load so the runtime norm stays uniform across architectures.
+    let fold_one = |mut v: Vec<f32>| -> Vec<f32> {
+        if is_gemma {
+            for x in v.iter_mut() {
+                *x += 1.0;
+            }
+        }
+        v
+    };
 
     let mut layers = Vec::with_capacity(n_layers);
     for i in 0..n_layers {
         let t = |suffix: &str| format!("blk.{i}.{suffix}");
+        let bias = |name: &str| -> io::Result<Option<Vec<f32>>> {
+            if g.tensors.contains_key(name) {
+                Ok(Some(g.tensor_f32(name)?))
+            } else {
+                Ok(None)
+            }
+        };
         layers.push(Layer {
-            rms_att: g.tensor_f32(&t("attn_norm.weight"))?,
+            rms_att: fold_one(g.tensor_f32(&t("attn_norm.weight"))?),
             wq: g.linear(&t("attn_q.weight"), precision)?,
             wk: g.linear(&t("attn_k.weight"), precision)?,
             wv: g.linear(&t("attn_v.weight"), precision)?,
             wo: g.linear(&t("attn_output.weight"), precision)?,
-            rms_ffn: g.tensor_f32(&t("ffn_norm.weight"))?,
+            bq: bias(&t("attn_q.bias"))?,
+            bk: bias(&t("attn_k.bias"))?,
+            bv: bias(&t("attn_v.bias"))?,
+            rms_ffn: fold_one(g.tensor_f32(&t("ffn_norm.weight"))?),
             w1: g.linear(&t("ffn_gate.weight"), precision)?,
             w2: g.linear(&t("ffn_down.weight"), precision)?,
             w3: g.linear(&t("ffn_up.weight"), precision)?,
         });
     }
 
-    let rms_final = g.tensor_f32("output_norm.weight")?;
+    let rms_final = fold_one(g.tensor_f32("output_norm.weight")?);
 
     // Tied-embedding models omit output.weight.
     let shared_classifier = !g.tensors.contains_key("output.weight");
@@ -470,13 +404,92 @@ pub fn load(path: &Path, precision: Precision) -> io::Result<(Model, Tokenizer)>
         seq_len,
         shared_classifier,
         rope_theta,
+        head_dim,
+        norm_eps,
+        // llama GGUFs are stored un-permuted for interleaved rope (NORM);
+        // qwen2/gemma use the NeoX rotate_half convention.
+        rope_neox: !matches!(arch.as_str(), "llama"),
+        act: if is_gemma { Activation::GeluTanh } else { Activation::Silu },
+        emb_scale: if is_gemma { (dim as f32).sqrt() } else { 1.0 },
     };
+    if is_gemma {
+        // Gemma ties the classifier and scales embeddings; nothing extra to
+        // do here (scale applies at lookup), but keep tok_emb unscaled.
+        let _ = &mut tok_emb;
+    }
     Ok((Model { config, tok_emb, layers, rms_final, wcls }, tokenizer))
+}
+
+/// Build the right tokenizer from GGUF metadata: SentencePiece ("llama") or
+/// byte-level BPE with merges ("gpt2", used by Qwen2).
+fn load_tokenizer(g: &Gguf) -> io::Result<AnyTokenizer> {
+    let tokens = match g.metadata.get("tokenizer.ggml.tokens") {
+        Some(Value::Arr(items)) => items,
+        _ => return Err(err("missing tokenizer.ggml.tokens")),
+    };
+    let model = match g.metadata.get("tokenizer.ggml.model") {
+        Some(Value::Str(s)) => String::from_utf8_lossy(s).into_owned(),
+        _ => "llama".to_string(),
+    };
+    let bos = g.metadata.get("tokenizer.ggml.bos_token_id").and_then(Value::as_usize);
+    let eos = g.metadata.get("tokenizer.ggml.eos_token_id").and_then(Value::as_usize);
+    let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") {
+        Some(Value::Bool(b)) => *b,
+        _ => model == "llama", // SPM models default to BOS, BPE models to none
+    };
+
+    match model.as_str() {
+        "llama" => {
+            // SentencePiece: pieces carry U+2581 word markers; ours use spaces.
+            let vocab: Vec<Vec<u8>> = tokens
+                .iter()
+                .map(|v| match v {
+                    Value::Str(s) => {
+                        String::from_utf8_lossy(s).replace('\u{2581}', " ").into_bytes()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect();
+            let scores: Vec<f32> = match g.metadata.get("tokenizer.ggml.scores") {
+                Some(Value::Arr(items)) => items.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect(),
+                _ => vec![0.0; vocab.len()],
+            };
+            let tok = Tokenizer::from_parts(vocab, scores).with_special(
+                bos.unwrap_or(1) as u32,
+                eos.unwrap_or(2) as u32,
+                add_bos,
+            );
+            Ok(AnyTokenizer::Spm(Box::new(tok)))
+        }
+        "gpt2" => {
+            let vocab: Vec<String> = tokens
+                .iter()
+                .map(|v| match v {
+                    Value::Str(s) => String::from_utf8_lossy(s).into_owned(),
+                    _ => String::new(),
+                })
+                .collect();
+            let merges: Vec<String> = match g.metadata.get("tokenizer.ggml.merges") {
+                Some(Value::Arr(items)) => items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Str(s) => String::from_utf8_lossy(s).into_owned(),
+                        _ => String::new(),
+                    })
+                    .collect(),
+                _ => return Err(err("gpt2 tokenizer requires tokenizer.ggml.merges")),
+            };
+            let tok = crate::bpe::BpeTokenizer::new(vocab, &merges, bos.map(|v| v as u32), eos.map(|v| v as u32), add_bos);
+            Ok(AnyTokenizer::Bpe(Box::new(tok)))
+        }
+        other => Err(err(format!("unsupported tokenizer.ggml.model '{other}'"))),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prana_kernels::q4k_scale_min;
 
     /// Minimal GGUF writer for tests.
     struct W(Vec<u8>);
@@ -495,6 +508,177 @@ mod tests {
             self.0.extend_from_slice(&8u32.to_le_bytes());
             self.str_(v.as_bytes());
         }
+    }
+
+    /// Build a complete tiny model file for an architecture, with an embedded
+    /// SPM tokenizer (arch mechanics and tokenizer family are orthogonal —
+    /// the BPE tokenizer has its own unit tests in `bpe.rs`).
+    fn synthetic_model_gguf(arch: &str, with_biases: bool, head_dim: usize) -> Vec<u8> {
+        let (dim, hidden, n_layers, n_heads, vocab, ctx) = (32usize, 64usize, 2usize, 2usize, 48usize, 16usize);
+        let q_dim = n_heads * head_dim;
+        let kv_dim = q_dim; // MHA in the test
+
+        let mut rng_state = 0xABCDEF12345u64;
+        let mut f32s = |n: usize, scale: f32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(n * 4);
+            for _ in 0..n {
+                rng_state ^= rng_state >> 12;
+                rng_state ^= rng_state << 25;
+                rng_state ^= rng_state >> 27;
+                let r = ((rng_state >> 40) as f32 / (1u64 << 24) as f32) - 0.5;
+                out.extend_from_slice(&(r * scale).to_le_bytes());
+            }
+            out
+        };
+
+        // (name, ne, data)
+        let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+        tensors.push(("token_embd.weight".into(), vec![dim, vocab], f32s(vocab * dim, 0.1)));
+        for i in 0..n_layers {
+            tensors.push((format!("blk.{i}.attn_norm.weight"), vec![dim], f32s(dim, 0.5)));
+            tensors.push((format!("blk.{i}.attn_q.weight"), vec![dim, q_dim], f32s(q_dim * dim, 0.1)));
+            tensors.push((format!("blk.{i}.attn_k.weight"), vec![dim, kv_dim], f32s(kv_dim * dim, 0.1)));
+            tensors.push((format!("blk.{i}.attn_v.weight"), vec![dim, kv_dim], f32s(kv_dim * dim, 0.1)));
+            tensors.push((format!("blk.{i}.attn_output.weight"), vec![q_dim, dim], f32s(dim * q_dim, 0.1)));
+            if with_biases {
+                tensors.push((format!("blk.{i}.attn_q.bias"), vec![q_dim], f32s(q_dim, 0.05)));
+                tensors.push((format!("blk.{i}.attn_k.bias"), vec![kv_dim], f32s(kv_dim, 0.05)));
+                tensors.push((format!("blk.{i}.attn_v.bias"), vec![kv_dim], f32s(kv_dim, 0.05)));
+            }
+            tensors.push((format!("blk.{i}.ffn_norm.weight"), vec![dim], f32s(dim, 0.5)));
+            tensors.push((format!("blk.{i}.ffn_gate.weight"), vec![dim, hidden], f32s(hidden * dim, 0.1)));
+            tensors.push((format!("blk.{i}.ffn_down.weight"), vec![hidden, dim], f32s(dim * hidden, 0.1)));
+            tensors.push((format!("blk.{i}.ffn_up.weight"), vec![dim, hidden], f32s(hidden * dim, 0.1)));
+        }
+        tensors.push(("output_norm.weight".into(), vec![dim], f32s(dim, 0.5)));
+
+        // --- header + metadata ---
+        let mut w = W(Vec::new());
+        w.0.extend_from_slice(&MAGIC.to_le_bytes());
+        w.0.extend_from_slice(&3u32.to_le_bytes());
+        w.0.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        w.0.extend_from_slice(&11u64.to_le_bytes()); // kv count below
+        w.kv_str("general.architecture", arch);
+        w.kv_u32(&format!("{arch}.embedding_length"), dim as u32);
+        w.kv_u32(&format!("{arch}.block_count"), n_layers as u32);
+        w.kv_u32(&format!("{arch}.attention.head_count"), n_heads as u32);
+        w.kv_u32(&format!("{arch}.attention.head_count_kv"), n_heads as u32);
+        w.kv_u32(&format!("{arch}.feed_forward_length"), hidden as u32);
+        w.kv_u32(&format!("{arch}.context_length"), ctx as u32);
+        w.kv_u32(&format!("{arch}.attention.key_length"), head_dim as u32);
+        w.kv_str("tokenizer.ggml.model", "llama");
+        // tokens: specials + ascii singles
+        w.str_(b"tokenizer.ggml.tokens");
+        w.0.extend_from_slice(&9u32.to_le_bytes()); // type arr
+        w.0.extend_from_slice(&8u32.to_le_bytes()); // elem type str
+        w.0.extend_from_slice(&(vocab as u64).to_le_bytes());
+        for i in 0..vocab as u8 {
+            let piece: Vec<u8> = match i {
+                0 => b"<unk>".to_vec(),
+                1 => b"<s>".to_vec(),
+                2 => b"</s>".to_vec(),
+                3 => b" ".to_vec(),
+                i => vec![b'a' + (i - 4) % 26],
+            };
+            w.str_(&piece);
+        }
+        w.str_(b"tokenizer.ggml.scores");
+        w.0.extend_from_slice(&9u32.to_le_bytes());
+        w.0.extend_from_slice(&6u32.to_le_bytes()); // elem type f32
+        w.0.extend_from_slice(&(vocab as u64).to_le_bytes());
+        for _ in 0..vocab {
+            w.0.extend_from_slice(&(-1.0f32).to_le_bytes());
+        }
+
+        // --- tensor directory + data ---
+        let mut data_off = 0usize;
+        for (name, ne, data) in &tensors {
+            w.str_(name.as_bytes());
+            w.0.extend_from_slice(&(ne.len() as u32).to_le_bytes());
+            for d in ne {
+                w.0.extend_from_slice(&(*d as u64).to_le_bytes());
+            }
+            w.0.extend_from_slice(&GGML_F32.to_le_bytes());
+            w.0.extend_from_slice(&(data_off as u64).to_le_bytes());
+            data_off = (data_off + data.len()).div_ceil(32) * 32;
+        }
+        while !w.0.len().is_multiple_of(32) {
+            w.0.push(0);
+        }
+        for (_, _, data) in &tensors {
+            while !w.0.len().is_multiple_of(32) {
+                w.0.push(0);
+            }
+            w.0.extend_from_slice(data);
+        }
+        w.0
+    }
+
+    fn load_from_bytes(bytes: Vec<u8>) -> (Model, AnyTokenizer) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0); // tests run in parallel
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("prana-test-{}-{n}.gguf", std::process::id()));
+        std::fs::write(&dir, bytes).unwrap();
+        let out = load(&dir, Precision::F32).unwrap();
+        let _ = std::fs::remove_file(&dir);
+        out
+    }
+
+    #[test]
+    fn qwen2_arch_loads_with_biases_and_runs() {
+        let (model, tok) = load_from_bytes(synthetic_model_gguf("qwen2", true, 16));
+        assert!(model.config.rope_neox, "qwen2 must use NeoX rope");
+        assert_eq!(model.config.act, Activation::Silu);
+        assert_eq!(model.config.emb_scale, 1.0);
+        assert!(model.layers[0].bq.is_some(), "qwen2 QKV biases must load");
+        assert_eq!(tok.vocab_size(), 48);
+
+        let mut cache = crate::KvCache::new(&model);
+        let a = crate::forward(&model, &mut cache, 5, 0);
+        let b = crate::forward(&model, &mut cache, 5, 1);
+        assert_eq!(a.len(), 48);
+        assert!(a.iter().chain(&b).all(|v| v.is_finite()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn qwen2_biases_change_the_output() {
+        let (with_bias, _) = load_from_bytes(synthetic_model_gguf("qwen2", true, 16));
+        let (no_bias, _) = load_from_bytes(synthetic_model_gguf("qwen2", false, 16));
+        let mut c1 = crate::KvCache::new(&with_bias);
+        let mut c2 = crate::KvCache::new(&no_bias);
+        let a = crate::forward(&with_bias, &mut c1, 7, 0);
+        let b = crate::forward(&no_bias, &mut c2, 7, 0);
+        assert_ne!(a, b, "bias tensors must affect logits");
+    }
+
+    #[test]
+    fn gemma_arch_gets_its_knobs_and_decoupled_head_dim() {
+        // head_dim 8 with dim=32, heads=2 -> q_dim 16 != dim, like real Gemma.
+        let (model, _) = load_from_bytes(synthetic_model_gguf("gemma", false, 8));
+        assert!(model.config.rope_neox);
+        assert_eq!(model.config.act, Activation::GeluTanh);
+        assert_eq!(model.config.head_dim, 8);
+        assert_eq!(model.config.q_dim(), 16);
+        assert!((model.config.emb_scale - (32f32).sqrt()).abs() < 1e-6);
+
+        let mut cache = crate::KvCache::new(&model);
+        for pos in 0..4 {
+            let logits = crate::forward(&model, &mut cache, (pos + 3) as u32, pos);
+            assert!(logits.iter().all(|v| v.is_finite()), "pos {pos}");
+        }
+    }
+
+    #[test]
+    fn gemma_norm_weights_are_folded_plus_one() {
+        // The raw file stores rms weights ~N(0, 0.5); after folding they must
+        // center near 1.0. Compare against the llama load of identical bytes.
+        let (gemma, _) = load_from_bytes(synthetic_model_gguf("gemma", false, 16));
+        let (llama, _) = load_from_bytes(synthetic_model_gguf("llama", false, 16));
+        let g_mean: f32 = gemma.rms_final.iter().sum::<f32>() / gemma.rms_final.len() as f32;
+        let l_mean: f32 = llama.rms_final.iter().sum::<f32>() / llama.rms_final.len() as f32;
+        assert!((g_mean - (l_mean + 1.0)).abs() < 1e-5, "gemma {g_mean} vs llama {l_mean}");
     }
 
     #[test]

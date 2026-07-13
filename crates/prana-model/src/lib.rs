@@ -7,16 +7,17 @@
 //! the KV-cached forward pass built from `prana-kernels`. Everything here is
 //! `#![forbid(unsafe_code)]`.
 
+pub mod bpe;
 pub mod checkpoint;
 pub mod gguf;
 pub mod infer;
 pub mod sampler;
 pub mod tokenizer;
 
-pub use checkpoint::{Config, Model, Precision};
+pub use checkpoint::{Activation, Config, Model, Precision};
 pub use infer::{forward, generate, GenStats, KvCache};
 pub use sampler::Sampler;
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{AnyTokenizer, Tokenize, Tokenizer};
 
 #[cfg(test)]
 mod tests {

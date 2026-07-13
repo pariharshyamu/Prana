@@ -65,9 +65,9 @@ fn run() {
 
     println!("== Prana run: real-model inference on safe Rust kernels ==\n");
     let t_load = std::time::Instant::now();
-    let (model, tokenizer) = if is_gguf {
+    let (model, tokenizer): (_, Box<dyn prana_model::Tokenize>) = if is_gguf {
         match gguf::load(std::path::Path::new(&model_path), precision) {
-            Ok(mt) => mt,
+            Ok((m, t)) => (m, Box::new(t)),
             Err(e) => {
                 eprintln!("cannot load '{model_path}': {e}");
                 std::process::exit(1);
@@ -88,7 +88,7 @@ fn run() {
                 eprintln!("cannot load tokenizer '{tok_path}': {e}");
                 std::process::exit(1);
             });
-        (model, tokenizer)
+        (model, Box::new(tokenizer))
     };
 
     let c = &model.config;
@@ -107,7 +107,7 @@ fn run() {
 
     // The stream includes the prompt's own pieces as they are prefilled.
     let mut sampler = Sampler::new(temp, seed);
-    let stats = prana_model::generate(&model, &tokenizer, &prompt, steps, &mut sampler, |piece| {
+    let stats = prana_model::generate(&model, tokenizer.as_ref(), &prompt, steps, &mut sampler, |piece| {
         std::io::stdout().write_all(piece).ok();
         std::io::stdout().flush().ok();
     });

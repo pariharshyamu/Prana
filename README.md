@@ -48,7 +48,7 @@ boundary marked `#![forbid(unsafe_code)]`:
 | [`prana-kernels`](crates/prana-kernels) | `matmul` / `quants` / `norms_rope` / `attention` / `threading` | Q8 quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, scoped-thread `parallel_for` |
 | [`prana-graph`](crates/prana-graph) | `CactusGraph` | checked-handle, shape-validating, define-then-run graph |
 | [`prana-cactus`](crates/prana-cactus) | `bindings/rust/cactus.rs` + `cactus_engine.h` | **Phase 0**: safe RAII wrapper over the real Cactus C ABI — `Result` errors, streaming-callback trampoline with panic containment, grow-and-retry buffers; testable everywhere via an in-process mock of the ABI |
-| [`prana-model`](crates/prana-model) | `cactus-engine` model loading / tokenizer / sampling | **real-model inference**: llama2.c *and GGUF* loaders (F32/F16/Q8_0/Q4_K/Q6_K — Q4_K_M model files load; Q8_0 runs natively as `QuantMatrix`), Llama SentencePiece BPE tokenizer (file or GGUF-embedded), KV-cached forward pass, greedy/temperature sampling — zero `unsafe`, zero deps |
+| [`prana-model`](crates/prana-model) | `cactus-engine` model loading / tokenizer / sampling | **real-model inference**: llama2.c *and GGUF* loaders for **llama, qwen2, and gemma** architectures (F32/F16/Q8_0/Q4_K/Q6_K, all quantized types running natively in packed form), SentencePiece *and* GPT-2 byte-level BPE tokenizers (file or GGUF-embedded), KV-cached forward pass with QKV biases / NeoX RoPE / GELU / decoupled head_dim, greedy/temperature sampling — zero `unsafe`, zero deps |
 | [`prana-cli`](crates/prana-cli) | `cactus run` / `benchmark` / `chat` | real-model text generation (`run`), transformer-block demo, microbenchmark, Phase 0 chat driver |
 
 ### Run it
@@ -114,10 +114,20 @@ llama2.c's reference output token-for-token through both container formats.
 It also implements **Phase 0 of the migration plan**: `prana-cactus`, a safe
 idiomatic wrapper over the engine's real C ABI, exercised against an
 in-process mock of that ABI (the native static lib is ARM/Metal-only).
-Still out of scope: ARM NEON/Metal targets, native (no-dequant) K-quant
-matmul kernels, safetensors, non-llama architectures (Qwen2/Phi), BPE-merges
-tokenizers (SmolLM-style GPT-2 vocab), and the CQ rotation-codebook
-quantization; those are the migration plan's later phases, not built here.
+**Architecture support:** llama-family plus **Qwen2** (QKV biases, NeoX RoPE,
+GPT-2 BPE tokenizer from GGUF merges) and **Gemma** ((1+w) RMSNorm folded at
+load, √dim embedding scale, tanh-GELU MLP, decoupled head_dim). Every model
+host reachable from this environment is egress-blocked, so Qwen2/Gemma are
+verified with synthetic GGUF fixtures (loader knobs, bias effects, norm
+folding, finite deterministic forward passes) rather than real weights — the
+llama path is the one verified token-identical against a reference
+implementation. K-quant tensors (Q4_K/Q6_K) run **natively in packed form**
+(4.5/6.6 bits per weight in RAM) with the AVX2 tier; native dots are
+parity-tested against dequantized dense matmuls.
+
+Still out of scope: ARM NEON/Metal targets, safetensors, further
+architectures (Phi, Gemma-2 softcapping), exact GPT-2 pre-tokenizer regex,
+and the CQ rotation-codebook quantization; later phases, not built here.
 
 ## License
 

@@ -15,12 +15,27 @@ use std::path::Path;
 pub const BOS: u32 = 1;
 pub const EOS: u32 = 2;
 
+/// What the generation loop needs from any tokenizer implementation.
+pub trait Tokenize {
+    /// Encode a prompt, including BOS if this model expects one.
+    fn encode_prompt(&self, text: &str) -> Vec<u32>;
+    /// Decode one token to bytes, given the previous token.
+    fn decode(&self, prev: u32, token: u32) -> Vec<u8>;
+    /// True if generation should stop at this token.
+    fn is_stop(&self, token: u32) -> bool;
+}
+
 pub struct Tokenizer {
     /// Piece bytes per token id.
     vocab: Vec<Vec<u8>>,
     scores: Vec<f32>,
     /// Piece bytes -> id (first occurrence wins, like run.c's sorted lookup).
     lookup: HashMap<Vec<u8>, u32>,
+    /// Special-token configuration (defaults to llama's 1/2; GGUF metadata
+    /// overrides for models like Gemma, where BOS=2 and EOS=1).
+    bos_id: u32,
+    eos_id: u32,
+    add_bos: bool,
 }
 
 impl Tokenizer {
@@ -36,7 +51,15 @@ impl Tokenizer {
         for (id, piece) in vocab.iter().enumerate() {
             lookup.entry(piece.clone()).or_insert(id as u32);
         }
-        Self { vocab, scores, lookup }
+        Self { vocab, scores, lookup, bos_id: BOS, eos_id: EOS, add_bos: true }
+    }
+
+    /// Override the special-token configuration (from GGUF metadata).
+    pub fn with_special(mut self, bos_id: u32, eos_id: u32, add_bos: bool) -> Self {
+        self.bos_id = bos_id;
+        self.eos_id = eos_id;
+        self.add_bos = add_bos;
+        self
     }
 
     /// Parse the tokenizer.bin layout: `u32 max_token_length`, then
@@ -66,7 +89,7 @@ impl Tokenizer {
     pub fn encode(&self, text: &str, bos: bool, eos: bool) -> Vec<u32> {
         let mut tokens: Vec<u32> = Vec::new();
         if bos {
-            tokens.push(BOS);
+            tokens.push(self.bos_id);
         }
         // SentencePiece dummy prefix: word-initial pieces carry a leading
         // space, so non-empty text starts with the " " token.
@@ -114,7 +137,7 @@ impl Tokenizer {
         }
 
         if eos {
-            tokens.push(EOS);
+            tokens.push(self.eos_id);
         }
         tokens
     }
@@ -132,10 +155,63 @@ impl Tokenizer {
                 return vec![b];
             }
         }
-        if prev == BOS && piece.first() == Some(&b' ') {
+        if prev == self.bos_id && piece.first() == Some(&b' ') {
             return piece[1..].to_vec();
         }
         piece.to_vec()
+    }
+}
+
+impl Tokenize for Tokenizer {
+    fn encode_prompt(&self, text: &str) -> Vec<u32> {
+        self.encode(text, self.add_bos, false)
+    }
+
+    fn decode(&self, prev: u32, token: u32) -> Vec<u8> {
+        Tokenizer::decode(self, prev, token)
+    }
+
+    fn is_stop(&self, token: u32) -> bool {
+        token == self.eos_id || token == self.bos_id
+    }
+}
+
+/// Tokenizer dispatch across the vocab families GGUF embeds.
+/// (Boxed variants: the BPE tables are much larger than the SPM struct.)
+pub enum AnyTokenizer {
+    Spm(Box<Tokenizer>),
+    Bpe(Box<crate::bpe::BpeTokenizer>),
+}
+
+impl AnyTokenizer {
+    pub fn vocab_size(&self) -> usize {
+        match self {
+            AnyTokenizer::Spm(t) => t.vocab_size(),
+            AnyTokenizer::Bpe(t) => t.vocab_size(),
+        }
+    }
+}
+
+impl Tokenize for AnyTokenizer {
+    fn encode_prompt(&self, text: &str) -> Vec<u32> {
+        match self {
+            AnyTokenizer::Spm(t) => t.encode_prompt(text),
+            AnyTokenizer::Bpe(t) => t.encode_prompt(text),
+        }
+    }
+
+    fn decode(&self, prev: u32, token: u32) -> Vec<u8> {
+        match self {
+            AnyTokenizer::Spm(t) => Tokenize::decode(t.as_ref(), prev, token),
+            AnyTokenizer::Bpe(t) => t.decode(prev, token),
+        }
+    }
+
+    fn is_stop(&self, token: u32) -> bool {
+        match self {
+            AnyTokenizer::Spm(t) => t.is_stop(token),
+            AnyTokenizer::Bpe(t) => t.is_stop(token),
+        }
     }
 }
 

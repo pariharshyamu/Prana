@@ -30,6 +30,16 @@ pub fn silu(x: &mut [f32]) {
     }
 }
 
+/// Tanh-approximated GELU in place — the MLP activation in Gemma (and GPT
+/// lineage): `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
+pub fn gelu_tanh(x: &mut [f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    for v in x.iter_mut() {
+        let x3 = *v * *v * *v;
+        *v = 0.5 * *v * (1.0 + (SQRT_2_OVER_PI * (*v + 0.044715 * x3)).tanh());
+    }
+}
+
 /// Numerically stable softmax over a single vector (subtract max before exp).
 pub fn softmax(logits: &[f32]) -> Vec<f32> {
     if logits.is_empty() {
@@ -77,6 +87,16 @@ mod tests {
         assert!((x[1] - 0.731_058_6).abs() < 1e-5); // 1*sigmoid(1)
         assert!((x[2] + 0.268_941_4).abs() < 1e-5); // -1*sigmoid(-1)
         assert!(x[3] > 3.9 && x[3] < 4.0); // large x -> ~identity
+    }
+
+    #[test]
+    fn gelu_tanh_matches_reference_points() {
+        let mut x = vec![0.0f32, 1.0, -1.0, 3.0];
+        gelu_tanh(&mut x);
+        assert_eq!(x[0], 0.0);
+        assert!((x[1] - 0.841_192).abs() < 1e-4); // gelu(1) ≈ 0.8412
+        assert!((x[2] + 0.158_808).abs() < 1e-4); // gelu(-1) ≈ -0.1588
+        assert!((x[3] - 2.995_9).abs() < 1e-3); // large x → ~identity
     }
 
     #[test]

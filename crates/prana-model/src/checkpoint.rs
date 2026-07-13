@@ -12,9 +12,20 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use prana_kernels::{matmul_f32, matmul_q8_f32, quantize_q8, QuantMatrix, Q8_BLOCK};
+use prana_kernels::{
+    matmul_f32, matmul_kquant_f32, matmul_q8_f32, quantize_q8, KQuantMatrix, QuantMatrix, Q8_BLOCK,
+};
 
-/// Model hyperparameters, from the checkpoint header.
+/// MLP gate activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    /// SwiGLU gate (Llama, Qwen2, TinyStories).
+    Silu,
+    /// Tanh-approximated GELU gate (Gemma).
+    GeluTanh,
+}
+
+/// Model hyperparameters — from the llama2.c header or GGUF metadata.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     pub dim: usize,
@@ -29,14 +40,25 @@ pub struct Config {
     /// RoPE frequency base (10000 for llama2.c models; GGUF metadata may
     /// override, e.g. long-context fine-tunes).
     pub rope_theta: f32,
+    /// Per-head width. Usually `dim / n_heads`, but explicit because Gemma
+    /// decouples them (e.g. 2048-dim model with 8 heads of 256).
+    pub head_dim: usize,
+    /// RMSNorm epsilon (1e-5 llama2.c/llama; 1e-6 qwen2/gemma).
+    pub norm_eps: f32,
+    /// NeoX (`rotate_half`) RoPE instead of interleaved pairs — Qwen2/Gemma.
+    pub rope_neox: bool,
+    /// MLP gate activation.
+    pub act: Activation,
+    /// Token embedding scale on lookup (Gemma: √dim; others: 1).
+    pub emb_scale: f32,
 }
 
 impl Config {
-    pub fn head_dim(&self) -> usize {
-        self.dim / self.n_heads
-    }
     pub fn kv_dim(&self) -> usize {
-        self.n_kv_heads * self.head_dim()
+        self.n_kv_heads * self.head_dim
+    }
+    pub fn q_dim(&self) -> usize {
+        self.n_heads * self.head_dim
     }
 }
 
@@ -52,6 +74,9 @@ pub enum Precision {
 pub enum Linear {
     F32 { w: Vec<f32>, rows: usize, cols: usize },
     Q8(QuantMatrix),
+    /// GGUF K-quant tensor (Q4_K / Q6_K) kept in its packed block format and
+    /// dotted natively — never dequantized to f32.
+    KQuant(KQuantMatrix),
 }
 
 impl Linear {
@@ -68,6 +93,7 @@ impl Linear {
         match self {
             Linear::F32 { w, rows, cols } => matmul_f32(x, w, 1, *cols, *rows),
             Linear::Q8(qm) => matmul_q8_f32(x, qm, 1),
+            Linear::KQuant(km) => matmul_kquant_f32(x, km, 1),
         }
     }
 
@@ -76,6 +102,7 @@ impl Linear {
         match self {
             Linear::F32 { w, .. } => w.len() * 4,
             Linear::Q8(qm) => qm.stored_bytes(),
+            Linear::KQuant(km) => km.stored_bytes(),
         }
     }
 }
@@ -87,6 +114,10 @@ pub struct Layer {
     pub wk: Linear,
     pub wv: Linear,
     pub wo: Linear,
+    /// QKV biases (Qwen2); `None` elsewhere.
+    pub bq: Option<Vec<f32>>,
+    pub bk: Option<Vec<f32>>,
+    pub bv: Option<Vec<f32>>,
     pub rms_ffn: Vec<f32>,
     pub w1: Linear, // gate
     pub w2: Linear, // down
@@ -178,6 +209,9 @@ pub fn load_bytes(data: &[u8], precision: Precision) -> io::Result<Model> {
     let vocab_raw = cur.i32()?;
     let seq_len = cur.i32()? as usize;
 
+    if dim == 0 || n_heads == 0 || !dim.is_multiple_of(n_heads) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad checkpoint header"));
+    }
     let shared_classifier = vocab_raw > 0;
     let vocab_size = vocab_raw.unsigned_abs() as usize;
     let config = Config {
@@ -190,11 +224,13 @@ pub fn load_bytes(data: &[u8], precision: Precision) -> io::Result<Model> {
         seq_len,
         shared_classifier,
         rope_theta: 10000.0,
+        head_dim: dim / n_heads,
+        norm_eps: 1e-5,
+        rope_neox: false,
+        act: Activation::Silu,
+        emb_scale: 1.0,
     };
-    if dim == 0 || n_heads == 0 || !dim.is_multiple_of(n_heads) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad checkpoint header"));
-    }
-    let head_dim = config.head_dim();
+    let head_dim = config.head_dim;
     let kv_dim = config.kv_dim();
 
     let tok_emb = cur.f32s(vocab_size * dim)?;
@@ -239,6 +275,9 @@ pub fn load_bytes(data: &[u8], precision: Precision) -> io::Result<Model> {
             wk: Linear::new(wk.next().unwrap(), kv_dim, dim, precision),
             wv: Linear::new(wv.next().unwrap(), kv_dim, dim, precision),
             wo: Linear::new(wo.next().unwrap(), dim, n_heads * head_dim, precision),
+            bq: None,
+            bk: None,
+            bv: None,
             rms_ffn: rms_ffn.next().unwrap(),
             w1: Linear::new(w1.next().unwrap(), hidden_dim, dim, precision),
             w2: Linear::new(w2.next().unwrap(), dim, hidden_dim, precision),

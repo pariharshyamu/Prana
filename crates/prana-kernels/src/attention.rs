@@ -63,6 +63,26 @@ pub fn rope_interleaved(x: &mut [f32], pos: usize, head_dim: usize, theta_base: 
     }
 }
 
+/// Apply NeoX-style (`rotate_half`) RoPE in place to a single position's
+/// activation row `[n_heads * head_dim]` — the convention Qwen2, Gemma, and
+/// other GPT-NeoX-lineage models use (ggml `ROPE_TYPE_NEOX`), pairing dim `j`
+/// with `j + head_dim/2` instead of adjacent elements.
+pub fn rope_neox(x: &mut [f32], pos: usize, head_dim: usize, theta_base: f32) {
+    assert_eq!(head_dim % 2, 0, "head_dim must be even for RoPE");
+    assert_eq!(x.len() % head_dim, 0, "row must be a whole number of heads");
+    let half = head_dim / 2;
+    for h in 0..x.len() / head_dim {
+        let base = h * head_dim;
+        for j in 0..half {
+            let freq = theta_base.powf(-(2.0 * j as f32) / head_dim as f32);
+            let (sin, cos) = (pos as f32 * freq).sin_cos();
+            let (x1, x2) = (x[base + j], x[base + j + half]);
+            x[base + j] = x1 * cos - x2 * sin;
+            x[base + j + half] = x1 * sin + x2 * cos;
+        }
+    }
+}
+
 /// One decode step of causal (grouped-query) attention against a KV cache.
 ///
 /// `q` is this position's query row `[n_heads * head_dim]`; `k_cache`/`v_cache`
@@ -269,6 +289,27 @@ mod tests {
             let n0 = before[i].powi(2) + before[i + 1].powi(2);
             let n1 = x[i].powi(2) + x[i + 1].powi(2);
             assert!((n0 - n1).abs() < 1e-4, "pair norm changed at {i}: {n0} vs {n1}");
+        }
+    }
+
+    #[test]
+    fn rope_neox_pairs_across_halves_and_matches_batch_rope() {
+        // rope_neox on a single row at position p must equal the batch rope()
+        // (also rotate_half) applied to a seq where that row sits at index p.
+        let n_heads = 2;
+        let head_dim = 8;
+        let w = n_heads * head_dim;
+        let row: Vec<f32> = (0..w).map(|i| (i as f32 * 0.17).sin() + 0.2).collect();
+
+        let pos = 3;
+        let mut batch = vec![0f32; 4 * w];
+        batch[pos * w..(pos + 1) * w].copy_from_slice(&row);
+        rope(&mut batch, 4, n_heads, head_dim, 10000.0);
+
+        let mut single = row.clone();
+        rope_neox(&mut single, pos, head_dim, 10000.0);
+        for (a, b) in single.iter().zip(&batch[pos * w..(pos + 1) * w]) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
         }
     }
 

@@ -24,14 +24,38 @@
 //! for parity against its scalar twin.
 
 mod attention;
+mod kquant;
 mod matmul;
 mod norms;
 mod pool;
 mod simd_x86;
 mod threading;
 
-pub use attention::{attention, attention_decode, rope, rope_interleaved};
+pub use attention::{attention, attention_decode, rope, rope_interleaved, rope_neox};
+pub use kquant::{
+    dequant_q4k_block, dequant_q6k_block, matmul_kquant_f32, q4k_scale_min, KQuantKind,
+    KQuantMatrix, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, QK_K,
+};
 pub use matmul::{dequantize_q8, matmul_f32, matmul_q8_f32, quantize_q8, QuantMatrix, Q8_BLOCK};
-pub use norms::{rmsnorm, silu, softmax};
+pub use norms::{gelu_tanh, rmsnorm, silu, softmax};
 pub use pool::{global as pool, Pool};
 pub use threading::parallel_for;
+
+/// IEEE 754 half → single conversion (handles subnormals, inf, NaN).
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let frac = (h & 0x3ff) as u32;
+    let bits = match (exp, frac) {
+        (0, 0) => sign << 31,
+        // subnormal: exact value is frac * 2^-24 (sign applied numerically)
+        (0, f) => {
+            let v = f as f32 * 2f32.powi(-24);
+            return if sign == 1 { -v } else { v };
+        }
+        (0x1f, 0) => (sign << 31) | 0x7f80_0000,
+        (0x1f, f) => (sign << 31) | 0x7f80_0000 | (f << 13),
+        (e, f) => (sign << 31) | ((e + 127 - 15) << 23) | (f << 13),
+    };
+    f32::from_bits(bits)
+}

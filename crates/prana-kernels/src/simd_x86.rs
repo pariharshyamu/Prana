@@ -92,6 +92,65 @@ mod imp {
             hsum(total)
         }
     }
+
+    /// AVX2+FMA native Q4_K row dot over packed 144-byte super-blocks.
+    /// `asums[g]` must hold the activation sum of 32-group `g` (the affine
+    /// `−dmin·m` term needs only Σa, not the per-element products).
+    ///
+    /// # Safety
+    /// Caller must ensure the CPU supports AVX2+FMA (see [`available`]).
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_q4k(a: &[f32], row: &[u8], asums: &[f32]) -> f32 {
+        use crate::kquant::{q4k_scale_min, Q4_K_BLOCK_BYTES, QK_K};
+        debug_assert_eq!(row.len() % Q4_K_BLOCK_BYTES, 0);
+        debug_assert_eq!(a.len(), row.len() / Q4_K_BLOCK_BYTES * QK_K);
+
+        let mut total = 0f32;
+        // SAFETY: every load below stays inside one 144-byte block (16-byte
+        // loads at qs offsets 0/16 of a 128-byte field) and inside a's
+        // matching 256-float window, both guaranteed by the debug-checked
+        // length relations; loadu tolerates unaligned addresses.
+        unsafe {
+            let nib_mask = _mm_set1_epi8(0x0F);
+            for (b_idx, b) in row.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+                let d = crate::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                let dmin = crate::f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+                let scales = &b[4..16];
+                let qs = b.as_ptr().add(16);
+                let a_blk = a.as_ptr().add(b_idx * QK_K);
+                let s_blk = &asums[b_idx * 8..(b_idx + 1) * 8];
+
+                for pair in 0..4 {
+                    let q = qs.add(pair * 32);
+                    let a_lo = a_blk.add(pair * 64);
+                    let a_hi = a_blk.add(pair * 64 + 32);
+                    let mut acc_lo = _mm256_setzero_ps();
+                    let mut acc_hi = _mm256_setzero_ps();
+                    // 32 bytes = two 16-byte halves; each half yields 16 low
+                    // and 16 high nibbles, converted 8 lanes at a time.
+                    for h in 0..2 {
+                        let bytes = _mm_loadu_si128(q.add(h * 16) as *const __m128i);
+                        let lo = _mm_and_si128(bytes, nib_mask);
+                        let hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), nib_mask);
+                        for j in 0..2 {
+                            let off = h * 16 + j * 8;
+                            let lo8 = if j == 0 { lo } else { _mm_srli_si128(lo, 8) };
+                            let hi8 = if j == 0 { hi } else { _mm_srli_si128(hi, 8) };
+                            let lo_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo8));
+                            let hi_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi8));
+                            acc_lo = _mm256_fmadd_ps(_mm256_loadu_ps(a_lo.add(off)), lo_f, acc_lo);
+                            acc_hi = _mm256_fmadd_ps(_mm256_loadu_ps(a_hi.add(off)), hi_f, acc_hi);
+                        }
+                    }
+                    let (sc1, m1) = q4k_scale_min(pair * 2, scales);
+                    let (sc2, m2) = q4k_scale_min(pair * 2 + 1, scales);
+                    total += d * sc1 * hsum(acc_lo) - dmin * m1 * s_blk[pair * 2];
+                    total += d * sc2 * hsum(acc_hi) - dmin * m2 * s_blk[pair * 2 + 1];
+                }
+            }
+        }
+        total
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -109,9 +168,14 @@ mod imp {
     pub unsafe fn dot_q8(_a: &[f32], _q: &[i8], _scales: &[f32]) -> f32 {
         unreachable!("simd tier unavailable on this target")
     }
+    /// # Safety
+    /// Never callable: `available()` is always false on this target.
+    pub unsafe fn dot_q4k(_a: &[f32], _row: &[u8], _asums: &[f32]) -> f32 {
+        unreachable!("simd tier unavailable on this target")
+    }
 }
 
-pub use imp::{available, dot_f32, dot_q8};
+pub use imp::{available, dot_f32, dot_q4k, dot_q8};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
