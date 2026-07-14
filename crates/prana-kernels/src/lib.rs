@@ -44,6 +44,7 @@ pub use matmul::{
 };
 pub use norms::{gelu_tanh, rmsnorm, silu, softmax};
 pub use pool::{global as pool, Pool};
+pub use simd_x86::{available as simd_available, available_vnni as simd_vnni_available};
 pub use team::{
     run_team, team_fill_rows, team_fill_rows_weighted, team_fill_slices, Team, TeamCell, TeamCtx,
 };

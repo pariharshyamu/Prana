@@ -339,6 +339,29 @@ fn bench() {
     }
     let quant_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
 
+    // Q4_0 same shape (synthetic packed blocks): isolates the q4_0 dot
+    // kernel against the q8 one at identical geometry.
+    let q40_ms = if k % 32 == 0 {
+        use prana_kernels::{matmul_kquant_f32, KQuantKind, KQuantMatrix};
+        let blocks = n_rows * k / 32;
+        let mut raw = vec![0u8; blocks * 18];
+        for (i, b) in raw.chunks_exact_mut(18).enumerate() {
+            b[0..2].copy_from_slice(&0x2e66u16.to_le_bytes()); // d ~ 0.1
+            for (j, q) in b[2..].iter_mut().enumerate() {
+                *q = ((i * 31 + j * 7) % 256) as u8;
+            }
+        }
+        let m40 = KQuantMatrix::from_raw(n_rows, k, KQuantKind::Q40, raw);
+        let t = Instant::now();
+        for _ in 0..iters {
+            let o = matmul_kquant_f32(&a, &m40, 1);
+            sink += o[0];
+        }
+        Some(t.elapsed().as_secs_f64() * 1e3 / iters as f64)
+    } else {
+        None
+    };
+
     let flops = 2.0 * k as f64 * n_rows as f64; // one MAC = 2 flops
     let dense_gflops = flops / (dense_ms * 1e-3) / 1e9;
     let quant_gflops = flops / (quant_ms * 1e-3) / 1e9;
@@ -347,10 +370,23 @@ fn bench() {
     let quant_bytes = qm.stored_bytes();
 
     println!("  problem           : [1 x {k}] * [{n_rows} x {k}]  (block={Q8_BLOCK})");
+    println!(
+        "  simd tier         : {}",
+        if prana_kernels::simd_vnni_available() {
+            "AVX2+FMA+AVX-VNNI"
+        } else if prana_kernels::simd_available() {
+            "AVX2+FMA"
+        } else {
+            "scalar"
+        }
+    );
     println!("  threads           : {} (PRANA_THREADS overrides)", prana_kernels::pool().threads);
     println!();
     println!("  dense  f32 matmul : {dense_ms:>7.3} ms/iter   {dense_gflops:>6.1} GFLOP/s");
     println!("  quant  q8  matmul : {quant_ms:>7.3} ms/iter   {quant_gflops:>6.1} GFLOP/s");
+    if let Some(ms) = q40_ms {
+        println!("  quant  q4_0 matmul: {ms:>7.3} ms/iter   {:>6.1} GFLOP/s", flops / (ms * 1e-3) / 1e9);
+    }
     println!();
     println!("  weight memory     : {} KiB f32  ->  {} KiB q8  ({:.2}x smaller)",
         dense_bytes / 1024, quant_bytes / 1024, dense_bytes as f64 / quant_bytes as f64);

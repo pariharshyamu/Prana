@@ -320,11 +320,10 @@ where
     D: Fn(usize) -> f32 + Sync,
 {
     let pool = crate::pool::global();
-    // Measured on the integer kernels: dispatch+join costs ~20-60µs while a
-    // 1M-MAC job runs in ~40µs on one thread — fanning out anything smaller
-    // *loses* time. Per token this keeps the small Q/K/V/O projections serial
-    // on the hot thread and parallelizes only the FFN and LM-head matmuls.
-    const MIN_MACS_FOR_THREADS: usize = 1 << 20;
+    // Dispatch+join costs ~15-25µs (post notify-gating); a 256k-MAC job runs
+    // ~20µs on one thread, so that's the measured break-even. This keeps the
+    // tiny K/V projections serial and fans out Q/O, FFN and the LM head.
+    const MIN_MACS_FOR_THREADS: usize = 256 * 1024;
     if k * out.len() < MIN_MACS_FOR_THREADS || pool.threads == 1 {
         for (r, o) in out.iter_mut().enumerate() {
             *o = dot(r);
@@ -363,6 +362,10 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 /// Integer Q8×Q8 dot product: SIMD tier when available, scalar otherwise.
 #[inline]
 fn dot_q8_q8(acts: &QuantActs, q: &[i8], scales: &[f32]) -> f32 {
+    if crate::simd_x86::available_vnni() {
+        // SAFETY: available_vnni() verified AVX2+FMA+AVX-VNNI.
+        return unsafe { crate::simd_x86::dot_q8_q8_vnni(acts, q, scales) };
+    }
     if crate::simd_x86::available() {
         // SAFETY: available() verified AVX2+FMA support on this CPU.
         return unsafe { crate::simd_x86::dot_q8_q8(acts, q, scales) };

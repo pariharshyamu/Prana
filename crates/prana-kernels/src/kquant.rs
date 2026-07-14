@@ -119,6 +119,12 @@ pub struct KQuantMatrix {
     kind: KQuantKind,
     /// `rows * cols/block_values * block_bytes`, rows contiguous.
     blocks: Vec<u8>,
+    /// Block scales hoisted to f32 at load (`scales_per_block` per block,
+    /// same order as `blocks`). The packed blocks store them as f16, and a
+    /// matmul touches one per 32-256 weights — decoding f16 in the hot dot
+    /// loop measurably dominated decode (millions of conversions per
+    /// token), so it happens exactly once, here.
+    dscales: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +150,15 @@ impl KQuantKind {
             KQuantKind::Q4K | KQuantKind::Q6K => QK_K,
         }
     }
+
+    /// f16 scale fields per block (hoisted to `dscales`): Q4_K carries
+    /// `(d, dmin)`, the others a single `d`.
+    fn scales_per_block(self) -> usize {
+        match self {
+            KQuantKind::Q4K => 2,
+            KQuantKind::Q40 | KQuantKind::Q6K => 1,
+        }
+    }
 }
 
 impl KQuantMatrix {
@@ -152,7 +167,19 @@ impl KQuantMatrix {
         let bv = kind.block_values();
         assert_eq!(cols % bv, 0, "cols must be a multiple of {bv}");
         assert_eq!(blocks.len(), rows * cols / bv * kind.block_bytes());
-        Self { rows, cols, kind, blocks }
+        let f16 = |b: &[u8], off: usize| f16_to_f32(u16::from_le_bytes([b[off], b[off + 1]]));
+        let mut dscales = Vec::with_capacity(blocks.len() / kind.block_bytes() * kind.scales_per_block());
+        for b in blocks.chunks_exact(kind.block_bytes()) {
+            match kind {
+                KQuantKind::Q40 => dscales.push(f16(b, 0)),
+                KQuantKind::Q4K => {
+                    dscales.push(f16(b, 0));
+                    dscales.push(f16(b, 2));
+                }
+                KQuantKind::Q6K => dscales.push(f16(b, 208)),
+            }
+        }
+        Self { rows, cols, kind, blocks, dscales }
     }
 
     pub fn kind(&self) -> KQuantKind {
@@ -166,6 +193,12 @@ impl KQuantMatrix {
     fn row(&self, r: usize) -> &[u8] {
         let per_row = self.cols / self.kind.block_values() * self.kind.block_bytes();
         &self.blocks[r * per_row..(r + 1) * per_row]
+    }
+
+    /// The hoisted f32 scales of row `r`'s blocks.
+    fn row_dscales(&self, r: usize) -> &[f32] {
+        let per_row = self.cols / self.kind.block_values() * self.kind.scales_per_block();
+        &self.dscales[r * per_row..(r + 1) * per_row]
     }
 
     /// Integer dot of packed weight row `r` against quantized activations.
@@ -200,19 +233,20 @@ impl KQuantMatrix {
 }
 
 /// Scalar integer Q4_0 row dot against quantized activations:
-/// `Σ a·d(q−8) ≈ d·sa·(Σ qa·q − 8·Σ qa)`.
+/// `Σ a·d(q−8) ≈ d·sa·(Σ qa·q − 8·Σ qa)`. `ds` holds the row's hoisted
+/// f32 block scales — decoding the packed f16 here cost millions of scalar
+/// conversions per token before they were hoisted to load time.
 #[inline]
-fn dot_q40_q8_scalar(acts: &QuantActs, row: &[u8]) -> f32 {
+fn dot_q40_q8_scalar(acts: &QuantActs, row: &[u8], ds: &[f32]) -> f32 {
     let mut total = 0f32;
     for (i, b) in row.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
-        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
         let qa = &acts.q[i * 32..(i + 1) * 32];
         let mut s = 0i32;
         for l in 0..16 {
             s += qa[l] as i32 * (b[2 + l] & 0xF) as i32
                 + qa[16 + l] as i32 * (b[2 + l] >> 4) as i32;
         }
-        total += d * acts.scales[i] * (s - 8 * acts.sums[i]) as f32;
+        total += ds[i] * acts.scales[i] * (s - 8 * acts.sums[i]) as f32;
     }
     total
 }
@@ -220,11 +254,10 @@ fn dot_q40_q8_scalar(acts: &QuantActs, row: &[u8]) -> f32 {
 /// Scalar integer Q4_K row dot: per 32-group,
 /// `Σ a·(d·sc·q − dmin·m) ≈ sa·(d·sc·Σ qa·q − dmin·m·Σ qa)`.
 #[inline]
-fn dot_q4k_q8_scalar(acts: &QuantActs, row: &[u8]) -> f32 {
+fn dot_q4k_q8_scalar(acts: &QuantActs, row: &[u8], ds: &[f32]) -> f32 {
     let mut total = 0f32;
     for (b_idx, b) in row.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
-        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
-        let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+        let (d, dmin) = (ds[b_idx * 2], ds[b_idx * 2 + 1]);
         let scales = &b[4..16];
         let qs = &b[16..144];
         for pair in 0..4 {
@@ -251,13 +284,13 @@ fn dot_q4k_q8_scalar(acts: &QuantActs, row: &[u8]) -> f32 {
 /// Scalar integer Q6_K row dot (no affine trick needed — Q6_K has no mins;
 /// `q−32` fits i8 so the products accumulate in integers directly).
 #[inline]
-fn dot_q6k_q8_scalar(acts: &QuantActs, row: &[u8]) -> f32 {
+fn dot_q6k_q8_scalar(acts: &QuantActs, row: &[u8], ds: &[f32]) -> f32 {
     let mut total = 0f32;
     for (b_idx, b) in row.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
         let ql = &b[0..128];
         let qh = &b[128..192];
         let sc = &b[192..208];
-        let d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
+        let d = ds[b_idx];
         let qa_blk = &acts.q[b_idx * QK_K..(b_idx + 1) * QK_K];
         for half in 0..2 {
             let (ql, qh, s0, ao) = (&ql[half * 64..], &qh[half * 32..], half * 8, half * 128);
@@ -304,24 +337,28 @@ pub fn matmul_kquant_f32(a: &[f32], m: &KQuantMatrix, n_tokens: usize) -> Vec<f3
 #[inline]
 pub(crate) fn kquant_row_dot(m: &KQuantMatrix, acts: &QuantActs, r: usize) -> f32 {
     let row = m.row(r);
+    let ds = m.row_dscales(r);
     match m.kind {
         KQuantKind::Q40 => {
-            if crate::simd_x86::available() {
+            if crate::simd_x86::available_vnni() {
+                // SAFETY: available_vnni() verified AVX2+FMA+AVX-VNNI.
+                unsafe { crate::simd_x86::dot_q40_q8_vnni(acts, row, ds) }
+            } else if crate::simd_x86::available() {
                 // SAFETY: available() verified AVX2+FMA on this CPU.
-                unsafe { crate::simd_x86::dot_q40_q8(acts, row) }
+                unsafe { crate::simd_x86::dot_q40_q8(acts, row, ds) }
             } else {
-                dot_q40_q8_scalar(acts, row)
+                dot_q40_q8_scalar(acts, row, ds)
             }
         }
         KQuantKind::Q4K => {
             if crate::simd_x86::available() {
                 // SAFETY: available() verified AVX2+FMA on this CPU.
-                unsafe { crate::simd_x86::dot_q4k_q8(acts, row) }
+                unsafe { crate::simd_x86::dot_q4k_q8(acts, row, ds) }
             } else {
-                dot_q4k_q8_scalar(acts, row)
+                dot_q4k_q8_scalar(acts, row, ds)
             }
         }
-        KQuantKind::Q6K => dot_q6k_q8_scalar(acts, row),
+        KQuantKind::Q6K => dot_q6k_q8_scalar(acts, row, ds),
     }
 }
 
@@ -457,22 +494,31 @@ mod tests {
             }
             let a: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.021).cos()).collect();
             let acts = quantize_acts(&a);
+            // Hoisted f32 scales, exactly as from_raw builds them.
+            let m = KQuantMatrix::from_raw(1, cols, kind, row.clone());
+            let ds = m.row_dscales(0);
             let (scalar, simd) = match kind {
                 // SAFETY: available() checked above.
                 KQuantKind::Q40 => {
-                    (dot_q40_q8_scalar(&acts, &row), unsafe {
-                        crate::simd_x86::dot_q40_q8(&acts, &row)
+                    (dot_q40_q8_scalar(&acts, &row, ds), unsafe {
+                        crate::simd_x86::dot_q40_q8(&acts, &row, ds)
                     })
                 }
                 KQuantKind::Q4K => {
-                    (dot_q4k_q8_scalar(&acts, &row), unsafe {
-                        crate::simd_x86::dot_q4k_q8(&acts, &row)
+                    (dot_q4k_q8_scalar(&acts, &row, ds), unsafe {
+                        crate::simd_x86::dot_q4k_q8(&acts, &row, ds)
                     })
                 }
                 KQuantKind::Q6K => unreachable!(),
             };
             let tol = 1e-3 * scalar.abs().max(1.0);
             assert!((scalar - simd).abs() < tol, "{kind:?}: {scalar} vs {simd}");
+
+            if kind == KQuantKind::Q40 && crate::simd_x86::available_vnni() {
+                // SAFETY: available_vnni() checked.
+                let vnni = unsafe { crate::simd_x86::dot_q40_q8_vnni(&acts, &row, ds) };
+                assert!((scalar - vnni).abs() < tol, "vnni: {scalar} vs {vnni}");
+            }
         }
     }
 
