@@ -5,9 +5,9 @@
 //! Gemma's √dim embedding scale.
 
 use prana_kernels::{
-    attention, attention_decode, attention_decode_team, gelu_tanh, matmul_f32_team,
+    attention, attention_decode, attention_decode_team, f16_kv_write, gelu_tanh, matmul_f32_team,
     matmul_kquant_team, quantize_acts, rmsnorm, rope_interleaved, rope_neox, run_team, silu,
-    QuantActs, Team, TeamCell,
+    F16KvView, QuantActs, Team, TeamCell,
 };
 
 use crate::checkpoint::{Activation, Embedding, Model};
@@ -16,9 +16,15 @@ use crate::tokenizer::Tokenize;
 /// Mutable inference state: the per-layer KV caches. The buffers live in
 /// `TeamCell`s so team members can read them during attention while serial
 /// sections fill them — see `forward_team`.
+///
+/// K and V are stored at **half precision** (`u16` f16 bits): attention reads
+/// the whole cache every decode step, and that read grows with context, so
+/// halving it is the KV-cache optimization that scales. Values are converted
+/// f32→f16 on write ([`f16_kv_write`]) and f16→f32 on read (`F16KvView`); the
+/// added rounding is well below the model's existing quantization noise.
 pub struct KvCache {
-    k: Vec<TeamCell<Vec<f32>>>, // per layer: [seq_len, kv_dim]
-    v: Vec<TeamCell<Vec<f32>>>,
+    k: Vec<TeamCell<Vec<u16>>>, // per layer: [seq_len, kv_dim] f16 bits
+    v: Vec<TeamCell<Vec<u16>>>,
 }
 
 impl KvCache {
@@ -32,8 +38,8 @@ impl KvCache {
         let c = &model.config;
         let per_layer = positions.min(c.seq_len) * c.kv_dim();
         Self {
-            k: (0..c.n_layers).map(|_| TeamCell::new(vec![0f32; per_layer])).collect(),
-            v: (0..c.n_layers).map(|_| TeamCell::new(vec![0f32; per_layer])).collect(),
+            k: (0..c.n_layers).map(|_| TeamCell::new(vec![0u16; per_layer])).collect(),
+            v: (0..c.n_layers).map(|_| TeamCell::new(vec![0u16; per_layer])).collect(),
         }
     }
 }
@@ -168,12 +174,13 @@ fn forward_impl(
             rope_interleaved(&mut k, pos, head_dim, c.rope_theta);
         }
 
-        cache.k[l].get_mut()[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&k);
-        cache.v[l].get_mut()[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&v);
+        f16_kv_write(&mut cache.k[l].get_mut(), pos, kv_dim, &k);
+        f16_kv_write(&mut cache.v[l].get_mut(), pos, kv_dim, &v);
 
         let attn = timed(3, || {
             let (ck, cv) = (cache.k[l].read(), cache.v[l].read());
-            attention_decode(&q, &ck, &cv, pos, c.n_heads, c.n_kv_heads, head_dim)
+            let (kv, vv) = (F16KvView { data: &ck }, F16KvView { data: &cv });
+            attention_decode(&q, kv, vv, pos, c.n_heads, c.n_kv_heads, head_dim)
         });
         let o = timed(0, || layer.wo.apply(&attn));
         for (xi, oi) in x.iter_mut().zip(o) {
@@ -248,8 +255,8 @@ pub fn prefill(model: &Model, cache: &mut KvCache, tokens: &[u32]) {
                 rope_interleaved(&mut k[t * kv_dim..(t + 1) * kv_dim], t, head_dim, c.rope_theta);
             }
         }
-        cache.k[l].get_mut()[..n * kv_dim].copy_from_slice(&k);
-        cache.v[l].get_mut()[..n * kv_dim].copy_from_slice(&v);
+        f16_kv_write(&mut cache.k[l].get_mut(), 0, kv_dim, &k);
+        f16_kv_write(&mut cache.v[l].get_mut(), 0, kv_dim, &v);
 
         let attn = attention(&q, &k, &v, n, c.n_heads, c.n_kv_heads, head_dim);
         let acts_attn = row_acts(&attn, q_dim);
@@ -377,12 +384,13 @@ fn forward_team_member(
         // The KV cache is the one shared write the glue needs: thread 0
         // stores its (identical) copy.
         team.serial(|| {
-            cache.k[l].get_mut()[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&k);
-            cache.v[l].get_mut()[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&v);
+            f16_kv_write(&mut cache.k[l].get_mut(), pos, kv_dim, &k);
+            f16_kv_write(&mut cache.v[l].get_mut(), pos, kv_dim, &v);
         });
         {
             let (ck, cv) = (cache.k[l].read(), cache.v[l].read());
-            attention_decode_team(team, &q, &ck, &cv, pos, c.n_heads, c.n_kv_heads, head_dim, &scratch.attn);
+            let (kv, vv) = (F16KvView { data: &ck }, F16KvView { data: &cv });
+            attention_decode_team(team, &q, kv, vv, pos, c.n_heads, c.n_kv_heads, head_dim, &scratch.attn);
         }
         let (attn, acts_attn) = {
             let a = scratch.attn.read();

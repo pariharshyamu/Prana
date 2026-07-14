@@ -13,6 +13,43 @@
 //! all row-major. This is the layout the projection matmuls produce directly.
 
 use crate::norms::softmax;
+use crate::{f16_to_f32, f32_to_f16};
+
+/// A read view over a half-precision KV cache row-major `[capacity, kv_stride]`.
+/// The cache stores `u16` f16 bits; attention dequantizes each element on read,
+/// halving the memory the score/value loops stream (attention bandwidth grows
+/// with context, so this is the KV-cache win that scales).
+#[derive(Clone, Copy)]
+pub struct F16KvView<'a> {
+    pub data: &'a [u16],
+}
+
+impl<'a> F16KvView<'a> {
+    /// One K or V head vector at cache row `t`, dequantized to f32.
+    #[inline]
+    fn head_vec(&self, t: usize, kv_stride: usize, kv_h: usize, head_dim: usize) -> [f32; MAX_HEAD_DIM] {
+        let base = t * kv_stride + kv_h * head_dim;
+        let mut out = [0f32; MAX_HEAD_DIM];
+        for (o, &h) in out[..head_dim].iter_mut().zip(&self.data[base..base + head_dim]) {
+            *o = f16_to_f32(h);
+        }
+        out
+    }
+}
+
+/// Upper bound on head_dim for the stack scratch in [`F16KvView::head_vec`]
+/// (256 covers Gemma's 256-wide heads; larger asserts in debug via the copy).
+const MAX_HEAD_DIM: usize = 256;
+
+/// Write `src` (`n * kv_stride` f32) into the f16 cache at row `first_row`.
+/// Used to fill the cache from the projection outputs (decode: one row;
+/// prefill: the whole prompt window).
+pub fn f16_kv_write(cache: &mut [u16], first_row: usize, kv_stride: usize, src: &[f32]) {
+    let start = first_row * kv_stride;
+    for (dst, &v) in cache[start..start + src.len()].iter_mut().zip(src) {
+        *dst = f32_to_f16(v);
+    }
+}
 
 /// Apply Llama-style `rotate_half` RoPE in place to a `[seq, n_heads * head_dim]`
 /// tensor. Position `p` for row index `p` (0-based), pairing dim `j` with
@@ -91,8 +128,8 @@ pub fn rope_neox(x: &mut [f32], pos: usize, head_dim: usize, theta_base: f32) {
 /// output `[n_heads * head_dim]` — softmax(q·K/√d)·V over positions `0..=pos`.
 pub fn attention_decode(
     q: &[f32],
-    k_cache: &[f32],
-    v_cache: &[f32],
+    k_cache: F16KvView,
+    v_cache: F16KvView,
     pos: usize,
     n_heads: usize,
     n_kv_heads: usize,
@@ -100,9 +137,10 @@ pub fn attention_decode(
 ) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * head_dim);
     assert!(n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads));
+    assert!(head_dim <= MAX_HEAD_DIM, "head_dim {head_dim} exceeds cache scratch");
     let kv_stride = n_kv_heads * head_dim;
-    assert!(k_cache.len() >= (pos + 1) * kv_stride, "k_cache not filled to pos");
-    assert!(v_cache.len() >= (pos + 1) * kv_stride, "v_cache not filled to pos");
+    assert!(k_cache.data.len() >= (pos + 1) * kv_stride, "k_cache not filled to pos");
+    assert!(v_cache.data.len() >= (pos + 1) * kv_stride, "v_cache not filled to pos");
 
     let mut out = vec![0f32; n_heads * head_dim];
     for h in 0..n_heads {
@@ -126,8 +164,8 @@ pub fn attention_decode(
 #[allow(clippy::too_many_arguments)]
 fn decode_one_head(
     q: &[f32],
-    k_cache: &[f32],
-    v_cache: &[f32],
+    k_cache: F16KvView,
+    v_cache: F16KvView,
     pos: usize,
     h: usize,
     group: usize,
@@ -141,16 +179,16 @@ fn decode_one_head(
 
     let mut scores = vec![0f32; pos + 1];
     for (t, s) in scores.iter_mut().enumerate() {
-        let k_vec = &k_cache[t * kv_stride + kv_h * head_dim..t * kv_stride + (kv_h + 1) * head_dim];
-        let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
+        let k_vec = k_cache.head_vec(t, kv_stride, kv_h, head_dim);
+        let dot: f32 = q_vec.iter().zip(&k_vec[..head_dim]).map(|(a, b)| a * b).sum();
         *s = dot * scale;
     }
     let probs = softmax(&scores);
 
     dst.fill(0.0);
     for (t, &p) in probs.iter().enumerate() {
-        let v_vec = &v_cache[t * kv_stride + kv_h * head_dim..t * kv_stride + (kv_h + 1) * head_dim];
-        for (d, &vv) in dst.iter_mut().zip(v_vec) {
+        let v_vec = v_cache.head_vec(t, kv_stride, kv_h, head_dim);
+        for (d, &vv) in dst.iter_mut().zip(&v_vec[..head_dim]) {
             *d += p * vv;
         }
     }
@@ -162,8 +200,8 @@ fn decode_one_head(
 pub fn attention_decode_team(
     team: &crate::team::Team,
     q: &[f32],
-    k_cache: &[f32],
-    v_cache: &[f32],
+    k_cache: F16KvView,
+    v_cache: F16KvView,
     pos: usize,
     n_heads: usize,
     n_kv_heads: usize,
@@ -172,9 +210,10 @@ pub fn attention_decode_team(
 ) {
     assert_eq!(q.len(), n_heads * head_dim);
     assert!(n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads));
+    assert!(head_dim <= MAX_HEAD_DIM, "head_dim {head_dim} exceeds cache scratch");
     let kv_stride = n_kv_heads * head_dim;
-    assert!(k_cache.len() >= (pos + 1) * kv_stride, "k_cache not filled to pos");
-    assert!(v_cache.len() >= (pos + 1) * kv_stride, "v_cache not filled to pos");
+    assert!(k_cache.data.len() >= (pos + 1) * kv_stride, "k_cache not filled to pos");
+    assert!(v_cache.data.len() >= (pos + 1) * kv_stride, "v_cache not filled to pos");
     let group = n_heads / n_kv_heads;
 
     // One head scans (pos+1) K rows and V rows of head_dim each.
@@ -379,10 +418,22 @@ mod tests {
         let v: Vec<f32> = (0..seq * w).map(|i| (i as f32 * 0.03).sin()).collect();
 
         let full = attention(&q, &k, &v, seq, n_heads, n_heads, head_dim);
+        // The decode path reads an f16 cache; pack k/v the way the model does.
+        let kh: Vec<u16> = k.iter().map(|&x| f32_to_f16(x)).collect();
+        let vh: Vec<u16> = v.iter().map(|&x| f32_to_f16(x)).collect();
         for pos in 0..seq {
-            let step = attention_decode(&q[pos * w..(pos + 1) * w], &k, &v, pos, n_heads, n_heads, head_dim);
+            let step = attention_decode(
+                &q[pos * w..(pos + 1) * w],
+                F16KvView { data: &kh },
+                F16KvView { data: &vh },
+                pos,
+                n_heads,
+                n_heads,
+                head_dim,
+            );
             for (a, b) in full[pos * w..(pos + 1) * w].iter().zip(&step) {
-                assert!((a - b).abs() < 1e-5, "pos {pos}: {a} vs {b}");
+                // f16 cache rounding: ~1e-3 relative, well under model noise.
+                assert!((a - b).abs() < 3e-3, "pos {pos}: {a} vs {b}");
             }
         }
     }

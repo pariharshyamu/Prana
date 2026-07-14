@@ -205,9 +205,31 @@ machine (21.4 -> 29.0 tok/s end-to-end on a 59-token prompt; the batched
 path is compute-bound, so a cool machine gains more). Remaining prefill
 headroom: a register-blocked micro-kernel (unpack a weight row's nibbles
 once for several activation rows — llama.cpp/llamafile's remaining edge)
-and AVX-VNNI. Remaining decode levers: f16 KV cache and speculative
+and AVX-VNNI.
+
+The **KV cache is stored at half precision** (`u16` f16 bits): every decode
+step reads the whole cache to compute attention, and that read grows with
+context, so halving it halves the attention-side bandwidth — the KV
+optimization that scales with sequence length rather than being fixed
+overhead. Values round-trip through a hand-written round-to-nearest-even
+`f32<->f16` pair (unit-tested for exact representables, ties-to-even,
+overflow/subnormal edges); the added noise is ~1e-3 relative, far under the
+model's existing weight quantization, and greedy stories15M output is
+unchanged. At short context this is invisible in tok/s (attention is a few
+percent of the step); the point is that a 32k-context session now spends
+half the memory and half the attention read it otherwise would.
+
+A tried-and-reverted lever worth recording: a **two-row Q4_0 micro-kernel**
+that shared each activation load across two weight rows. Bitwise-correct and
+parity-tested, but interleaved A/B on this machine showed it within noise of
+the single-row kernel at every thread count — the activation vector (~3.5 KB)
+already stays L1-resident across rows, so there was no reload traffic to
+save. Reverted rather than ship complexity that benchmarks identical. The
+lesson: at >=4 threads on this box, decode is bandwidth-bound and SIMD
+micro-optimization has stopped paying; the levers that remain change
+bytes-moved (done: packed weights, f16 KV) or tokens-per-pass (speculative
 decoding — the one that can put effective decode throughput *above*
-llama.cpp's.
+llama.cpp's, still unbuilt).
 
 Everything above the kernel boundary is `#![forbid(unsafe_code)]`; the Phase 0
 crate concentrates the workspace's entire `unsafe` FFI surface into one
