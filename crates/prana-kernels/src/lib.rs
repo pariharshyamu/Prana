@@ -29,17 +29,22 @@ mod matmul;
 mod norms;
 mod pool;
 mod simd_x86;
+mod team;
 mod threading;
 
-pub use attention::{attention, attention_decode, rope, rope_interleaved, rope_neox};
+pub use attention::{attention, attention_decode, attention_decode_team, rope, rope_interleaved, rope_neox};
 pub use kquant::{
-    dequant_q40_block, dequant_q4k_block, dequant_q6k_block, matmul_kquant_f32, q4k_scale_min,
-    KQuantKind, KQuantMatrix, Q4_0_BLOCK, Q4_0_BLOCK_BYTES, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
-    QK_K,
+    dequant_q40_block, dequant_q4k_block, dequant_q6k_block, matmul_kquant_f32,
+    matmul_kquant_team, q4k_scale_min, KQuantKind, KQuantMatrix, Q4_0_BLOCK, Q4_0_BLOCK_BYTES,
+    Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, QK_K,
 };
-pub use matmul::{dequantize_q8, matmul_f32, matmul_q8_f32, quantize_q8, QuantMatrix, Q8_BLOCK};
+pub use matmul::{
+    dequantize_q8, matmul_f32, matmul_f32_team, matmul_q8_f32, matmul_q8_team, quantize_acts,
+    quantize_q8, QuantActs, QuantMatrix, Q8_BLOCK,
+};
 pub use norms::{gelu_tanh, rmsnorm, silu, softmax};
 pub use pool::{global as pool, Pool};
+pub use team::{run_team, team_fill_rows, team_fill_slices, Team, TeamCell, TeamCtx};
 pub use threading::parallel_for;
 
 /// IEEE 754 half → single conversion (handles subnormals, inf, NaN).

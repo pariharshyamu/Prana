@@ -694,6 +694,24 @@ mod tests {
     }
 
     #[test]
+    fn team_forward_is_bit_identical_to_classic_forward() {
+        // Same dots in the same order — team execution must not change a
+        // single bit of the logits, across architectures and positions.
+        for arch in ["llama", "qwen2", "gemma"] {
+            let (model, _) = load_from_bytes(synthetic_model_gguf(arch, arch == "qwen2", 16));
+            let mut c1 = crate::KvCache::new(&model);
+            let c2 = crate::KvCache::new(&model);
+            let scratch = crate::Scratch::new(&model);
+            for pos in 0..6 {
+                let tok = (pos * 5 + 3) as u32;
+                let classic = crate::forward(&model, &mut c1, tok, pos);
+                let team = crate::forward_team(&model, &c2, &scratch, tok, pos);
+                assert_eq!(classic, team, "{arch} diverged at pos {pos}");
+            }
+        }
+    }
+
+    #[test]
     fn qwen2_biases_change_the_output() {
         let (with_bias, _) = load_from_bytes(synthetic_model_gguf("qwen2", true, 16));
         let (no_bias, _) = load_from_bytes(synthetic_model_gguf("qwen2", false, 16));

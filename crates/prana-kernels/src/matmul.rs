@@ -169,6 +169,25 @@ pub fn matmul_q8_f32(a: &[f32], w: &QuantMatrix, n_tokens: usize) -> Vec<f32> {
     out
 }
 
+/// Team version of [`matmul_q8_f32`] for one already-quantized activation
+/// row (barriers only, no pool dispatch).
+pub fn matmul_q8_team(team: &crate::team::Team, acts: &QuantActs, w: &QuantMatrix, out: &crate::team::TeamCell<Vec<f32>>) {
+    let k = w.cols;
+    let groups_per_row = w.groups_per_row();
+    crate::team::team_fill_rows_weighted(team, out, w.rows, k, |r| {
+        let q_row = &w.q[r * k..(r + 1) * k];
+        let s_row = &w.scales[r * groups_per_row..(r + 1) * groups_per_row];
+        dot_q8_q8(acts, q_row, s_row)
+    });
+}
+
+/// Team version of the dense matmul for one activation row.
+pub fn matmul_f32_team(team: &crate::team::Team, a: &[f32], w: &[f32], n_rows: usize, out: &crate::team::TeamCell<Vec<f32>>) {
+    let k = a.len();
+    assert_eq!(w.len(), n_rows * k);
+    crate::team::team_fill_rows_weighted(team, out, n_rows, k, |r| dot_f32(a, &w[r * k..(r + 1) * k]));
+}
+
 /// Shared parallel driver for both matmul kernels.
 ///
 /// - **Decode** (`n_tokens == 1`): split the `n_rows` outputs across the pool.
@@ -239,7 +258,11 @@ where
     D: Fn(usize) -> f32 + Sync,
 {
     let pool = crate::pool::global();
-    const MIN_MACS_FOR_THREADS: usize = 32 * 1024;
+    // Measured on the integer kernels: dispatch+join costs ~20-60µs while a
+    // 1M-MAC job runs in ~40µs on one thread — fanning out anything smaller
+    // *loses* time. Per token this keeps the small Q/K/V/O projections serial
+    // on the hot thread and parallelizes only the FFN and LM-head matmuls.
+    const MIN_MACS_FOR_THREADS: usize = 1 << 20;
     if k * out.len() < MIN_MACS_FOR_THREADS || pool.threads == 1 {
         for (r, o) in out.iter_mut().enumerate() {
             *o = dot(r);

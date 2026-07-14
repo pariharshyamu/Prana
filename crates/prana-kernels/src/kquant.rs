@@ -288,31 +288,41 @@ pub fn matmul_kquant_f32(a: &[f32], m: &KQuantMatrix, n_tokens: usize) -> Vec<f3
 
     for t in 0..n_tokens {
         let acts = quantize_acts(&a[t * k..(t + 1) * k]);
-        let dot = |r: usize| -> f32 {
-            let row = m.row(r);
-            match m.kind {
-                KQuantKind::Q40 => {
-                    if crate::simd_x86::available() {
-                        // SAFETY: available() verified AVX2+FMA on this CPU.
-                        unsafe { crate::simd_x86::dot_q40_q8(&acts, row) }
-                    } else {
-                        dot_q40_q8_scalar(&acts, row)
-                    }
-                }
-                KQuantKind::Q4K => {
-                    if crate::simd_x86::available() {
-                        // SAFETY: available() verified AVX2+FMA on this CPU.
-                        unsafe { crate::simd_x86::dot_q4k_q8(&acts, row) }
-                    } else {
-                        dot_q4k_q8_scalar(&acts, row)
-                    }
-                }
-                KQuantKind::Q6K => dot_q6k_q8_scalar(&acts, row),
-            }
-        };
-        run_rows(&mut out[t * n_rows..(t + 1) * n_rows], k, dot);
+        run_rows(&mut out[t * n_rows..(t + 1) * n_rows], k, |r| kquant_row_dot(m, &acts, r));
     }
     out
+}
+
+/// One row of a packed-quantized matmul: integer dot against `acts`,
+/// dispatched by block format and SIMD availability.
+#[inline]
+pub(crate) fn kquant_row_dot(m: &KQuantMatrix, acts: &QuantActs, r: usize) -> f32 {
+    let row = m.row(r);
+    match m.kind {
+        KQuantKind::Q40 => {
+            if crate::simd_x86::available() {
+                // SAFETY: available() verified AVX2+FMA on this CPU.
+                unsafe { crate::simd_x86::dot_q40_q8(acts, row) }
+            } else {
+                dot_q40_q8_scalar(acts, row)
+            }
+        }
+        KQuantKind::Q4K => {
+            if crate::simd_x86::available() {
+                // SAFETY: available() verified AVX2+FMA on this CPU.
+                unsafe { crate::simd_x86::dot_q4k_q8(acts, row) }
+            } else {
+                dot_q4k_q8_scalar(acts, row)
+            }
+        }
+        KQuantKind::Q6K => dot_q6k_q8_scalar(acts, row),
+    }
+}
+
+/// Team version of [`matmul_kquant_f32`] for one activation row: fills
+/// `out[..rows]` across the team, no dispatch — barriers only.
+pub fn matmul_kquant_team(team: &crate::team::Team, acts: &QuantActs, m: &KQuantMatrix, out: &crate::team::TeamCell<Vec<f32>>) {
+    crate::team::team_fill_rows_weighted(team, out, m.rows, m.cols, |r| kquant_row_dot(m, acts, r));
 }
 
 #[cfg(test)]

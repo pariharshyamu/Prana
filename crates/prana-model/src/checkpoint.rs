@@ -13,7 +13,8 @@ use std::io;
 use std::path::Path;
 
 use prana_kernels::{
-    matmul_f32, matmul_kquant_f32, matmul_q8_f32, quantize_q8, KQuantMatrix, QuantMatrix, Q8_BLOCK,
+    matmul_f32, matmul_f32_team, matmul_kquant_f32, matmul_kquant_team, matmul_q8_f32,
+    matmul_q8_team, quantize_q8, KQuantMatrix, QuantActs, QuantMatrix, Team, TeamCell, Q8_BLOCK,
 };
 
 /// MLP gate activation.
@@ -94,6 +95,20 @@ impl Linear {
             Linear::F32 { w, rows, cols } => matmul_f32(x, w, 1, *cols, *rows),
             Linear::Q8(qm) => matmul_q8_f32(x, qm, 1),
             Linear::KQuant(km) => matmul_kquant_f32(x, km, 1),
+        }
+    }
+
+    /// Team version of [`Linear::apply`]: same dots, split across the team,
+    /// written into `out`. `acts` must be `x` quantized (`quantize_acts`);
+    /// the dense variant reads `x`, the quantized variants read `acts`.
+    pub fn apply_team(&self, team: &Team, x: &[f32], acts: &QuantActs, out: &TeamCell<Vec<f32>>) {
+        match self {
+            Linear::F32 { w, rows, cols } => {
+                debug_assert_eq!(x.len(), *cols);
+                matmul_f32_team(team, x, w, *rows, out);
+            }
+            Linear::Q8(qm) => matmul_q8_team(team, acts, qm, out),
+            Linear::KQuant(km) => matmul_kquant_team(team, acts, km, out),
         }
     }
 

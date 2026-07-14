@@ -167,7 +167,28 @@ concretely shows Phases 1–3 are feasible and what the layering looks like:
 | `prana-graph` | `CactusGraph` (`builder.cpp`, `execute.cpp`) | define-then-run graph where node handles are checked indices, ops validate shapes, and an unbound input yields a typed `Result` error instead of UB |
 | `prana-cactus` | `bindings/rust/cactus.rs` + `cactus_engine.h` | **Phase 0, working**: the full C ABI transcribed into a `sys` module, wrapped by a safe API — RAII `Model` (destroy-on-drop, panic-safe), `Result` errors carrying `cactus_get_last_error`, a streaming-callback trampoline that contains panics at the FFI boundary, and grow-and-retry handling for the header's fixed-buffer/out-param patterns. Tested against an in-process Rust mock of the same symbols (the real static lib is ARM/Metal-only); `--features link-cactus` binds the real engine through identical declarations |
 | `prana-model` | engine-side model loading, tokenizer, sampling | **runs real trained models.** Loads llama2.c checkpoints *and GGUF v2/v3* for **llama, qwen2, gemma** architectures (F32/F16/**Q4_0**/Q8_0/**Q4_K/Q6_K**; every quantized type runs natively in packed form — Q8_0 as `QuantMatrix`, Q4_0/K-quants on dedicated packed-block matmuls at 4.5/6.6 bits per weight, parity-tested against dequantized dense — and the embedding table stays packed with per-row dequant at lookup). SentencePiece and GPT-2 byte-level BPE tokenizers with control/special tokens; ChatML chat mode; per-arch knobs (QKV biases, NeoX vs interleaved RoPE, GELU vs SiLU, (1+w) norm folding, √dim embedding scale, decoupled head_dim). Verified on real weights two ways: greedy llama output token-identical to llama2.c's reference via both container formats, and an off-the-shelf Qwen2.5-0.5B-Instruct q4_0 GGUF answering ChatML prompts at ~31 tok/s on a laptop. Zero `unsafe`, zero dependencies |
-| `prana-cli` | `cactus run` / `cactus benchmark` | generates stories from the real model (`run`), runs a **complete transformer block** demo, microbenchmarks the decode-path matmul, and drives the Phase 0 wrapper (`chat`) |
+| `prana-cli` | `cactus run` / `cactus benchmark` | generates text from real models (`run`, with `--chat` ChatML mode), runs a **complete transformer block** demo, microbenchmarks the decode-path matmul (`bench`, size-parameterized) and the team-execution primitives (`teambench`), and drives the Phase 0 wrapper (`chat`) |
+
+**The threading investigation (vs llama.cpp).** Measured against Ollama
+(llama.cpp) on the same Qwen2.5-0.5B q4_0 file and the same Core Ultra 5
+laptop: llama.cpp decodes ~85 tok/s where Prana reaches ~30. Reading
+llama.cpp's `ggml-cpu` source pinned the difference to its execution model —
+one thread-team dispatch per token with every thread walking all graph nodes
+together, separated by two-atomic spin barriers (`ggml_barrier`), versus
+Prana's dispatch/join per matmul (measured 20-60µs each across ~170 matmuls a
+token, worse than the work for every projection under ~1M MACs). Prana now
+implements both: the default pool path keeps sub-1M-MAC projections serial
+and only fans out FFN/head matmuls, and `PRANA_TEAM=1` enables a faithful
+ggml-style team mode (`team.rs`: generation-counter barriers at 0.9-2.2µs,
+atomic work stealing, guard-checked `TeamCell` buffers, poison-on-panic) that
+is **bit-identical to the classic path** by test. On this hybrid-core Windows
+machine the team mode still loses (~21 vs ~29 tok/s): its win condition is
+all threads working through every op, but norms/rope/bias glue and the small
+projections stay serial at 0.5B scale, so 7 members busy-spin through those
+sections and the spinning eats the package power budget the working cores
+need. Closing the rest of the gap is scheduling engineering (parallelized
+glue, batched prefill, affinity), documented as future work — the kernels
+themselves already run llama.cpp's int8 arithmetic.
 
 Everything above the kernel boundary is `#![forbid(unsafe_code)]`; the Phase 0
 crate concentrates the workspace's entire `unsafe` FFI surface into one

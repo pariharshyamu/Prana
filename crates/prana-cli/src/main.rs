@@ -24,6 +24,7 @@ fn main() {
     match mode.as_str() {
         "demo" => demo(),
         "bench" => bench(),
+        "teambench" => teambench(),
         "chat" => chat(),
         "run" => run(),
         other => {
@@ -31,6 +32,50 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// Microbenchmark the team primitives: dispatch cost and per-barrier cost.
+fn teambench() {
+    use prana_kernels::run_team;
+    let threads = prana_kernels::pool().threads;
+    println!("== team primitives ({threads} threads) ==");
+
+    // Dispatch: empty team run.
+    let iters = 2000;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        run_team(|_| {});
+    }
+    println!("  run_team dispatch : {:>8.2} µs", t0.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+    // Barrier: one dispatch, many barriers inside.
+    let barriers = 20_000usize;
+    let t0 = Instant::now();
+    run_team(|team| {
+        for _ in 0..barriers {
+            team.barrier();
+        }
+    });
+    println!("  barrier           : {:>8.3} µs", t0.elapsed().as_secs_f64() * 1e6 / barriers as f64);
+
+    // for_chunks with matmul-like chunk counts.
+    let rounds = 5_000usize;
+    let t0 = Instant::now();
+    run_team(|team| {
+        for _ in 0..rounds {
+            team.for_chunks(threads * 4, |_| {});
+        }
+    });
+    println!("  for_chunks(4/thr) : {:>8.3} µs", t0.elapsed().as_secs_f64() * 1e6 / rounds as f64);
+
+    // serial section.
+    let t0 = Instant::now();
+    run_team(|team| {
+        for _ in 0..rounds {
+            team.serial(|| {});
+        }
+    });
+    println!("  serial (empty)    : {:>8.3} µs", t0.elapsed().as_secs_f64() * 1e6 / rounds as f64);
 }
 
 /// Generate text with a real model. Usage:
@@ -137,6 +182,9 @@ fn run() {
         stats.seconds,
         (stats.prompt_tokens + stats.generated_tokens) as f64 / stats.seconds
     );
+    if let Some(report) = prana_model::timing_report() {
+        print!("{report}");
+    }
 }
 
 /// Drive the Phase 0 wrapper end-to-end: open a model handle over the C ABI,
@@ -245,14 +293,19 @@ fn demo() {
 }
 
 /// Microbenchmark the decode-path matmul: a `[1 x k] * [n_rows x k]` projection,
-/// dense f32 vs on-the-fly Q8 dequant, repeated to get a stable timing.
+/// dense f32 vs integer Q8, repeated to get a stable timing.
+/// `prana bench [k n_rows iters]` — pass e.g. `896 151936 20` to measure a
+/// DRAM-streaming (cache-defeating) size instead of the cache-resident default.
 fn bench() {
     println!("== Prana microbenchmark: decode-path matmul ==\n");
 
-    // Roughly the shape of one big projection in a ~1.5B model layer.
-    let k = 2048;
-    let n_rows = 2048;
-    let iters = 200;
+    // Default: roughly one big projection in a ~1.5B model layer.
+    let arg = |i: usize, d: usize| {
+        std::env::args().nth(2 + i).and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let k = arg(0, 2048);
+    let n_rows = arg(1, 2048);
+    let iters = arg(2, 200);
 
     let a: Vec<f32> = (0..k).map(|i| (i as f32 * 0.001).sin()).collect();
     let w: Vec<f32> = (0..n_rows * k).map(|i| (i as f32 * 0.0007).cos()).collect();

@@ -37,6 +37,10 @@ struct Job {
     /// Set if any chunk panicked (swallowed in the worker, re-raised by the
     /// submitter once).
     panicked: AtomicBool,
+    /// Team job: each chunk index is a team membership (`ith`), whose body
+    /// contains barriers — so a thread must claim at most ONE, or it would
+    /// deadlock waiting for itself at a barrier.
+    team: bool,
 }
 
 // SAFETY: `f` is only dereferenced between publication and `remaining == 0`,
@@ -45,7 +49,8 @@ struct Job {
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
-/// Claim and execute chunks until the counter runs out.
+/// Claim and execute chunks until the counter runs out (or, for team jobs,
+/// after at most one membership).
 fn execute_chunks(job: &Job) {
     // SAFETY: see `Job` — we hold an Arc to the job and remaining > 0 for
     // every index we claim, so the erased borrow is live.
@@ -59,6 +64,9 @@ fn execute_chunks(job: &Job) {
             job.panicked.store(true, Ordering::Relaxed);
         }
         job.remaining.fetch_sub(1, Ordering::AcqRel);
+        if job.team {
+            break;
+        }
     }
 }
 
@@ -68,9 +76,20 @@ struct Shared {
     slot: Mutex<Option<Arc<Job>>>,
     /// Wakes parked workers when a new epoch is published.
     work_cv: Condvar,
+    /// Workers currently blocked on `work_cv` — publishing only pays the
+    /// kernel notify when someone is actually parked (in the decode loop
+    /// workers stay spinning, so the fast path is entirely user-space).
+    parked: AtomicU32,
     /// Wakes the submitter when a job's last chunk completes.
     done: Mutex<()>,
     done_cv: Condvar,
+    /// True only while the submitter is blocked on `done_cv` (it spins
+    /// first); workers skip the kernel notify otherwise.
+    submitter_waiting: AtomicBool,
+    /// Serializes whole dispatches: one job owns the pool at a time. Team
+    /// jobs *require* this — every worker must join the same job, so a
+    /// second concurrent job would starve the first's barriers.
+    submit: Mutex<()>,
 }
 
 pub struct Pool {
@@ -83,6 +102,10 @@ pub struct Pool {
 /// matmuls), so a generous spin keeps workers hot across those gaps —
 /// parked workers pay a futex wake before contributing, which on small
 /// per-layer projections means they arrive after the work is gone.
+// Workers spin this long before parking on the condvar. Deliberately modest:
+// on hybrid laptop parts, threads that busy-spin for milliseconds drain the
+// package power budget that the actually-working cores need for turbo — a
+// larger budget (tried at 2M) measurably *lowered* decode throughput.
 const SPIN_ITERS: u32 = 200_000;
 
 impl Pool {
@@ -91,8 +114,11 @@ impl Pool {
             epoch: AtomicU64::new(0),
             slot: Mutex::new(None),
             work_cv: Condvar::new(),
+            parked: AtomicU32::new(0),
             done: Mutex::new(()),
             done_cv: Condvar::new(),
+            submitter_waiting: AtomicBool::new(false),
+            submit: Mutex::new(()),
         }));
         for _ in 1..threads {
             thread::Builder::new()
@@ -116,6 +142,25 @@ impl Pool {
             }
             return;
         }
+        self.dispatch(n_chunks, f, false);
+    }
+
+    /// Run `f(ith)` exactly once per pool thread (`ith` in `0..threads`),
+    /// concurrently — team execution, where `f`'s body may contain
+    /// [`crate::team::Team`] barriers. Prefer [`crate::team::run_team`].
+    pub fn run_team(&self, f: &(dyn Fn(usize) + Sync)) {
+        if self.threads == 1 {
+            f(0);
+            return;
+        }
+        self.dispatch(self.threads, f, true);
+    }
+
+    fn dispatch(&self, n_chunks: usize, f: &(dyn Fn(usize) + Sync), team: bool) {
+        // One job owns the pool at a time (see `Shared::submit`). Held
+        // across the re-raise of worker panics, so tolerate poisoning —
+        // the lock guards no data, only exclusivity.
+        let _submit = self.shared.submit.lock().unwrap_or_else(|e| e.into_inner());
 
         /// The one unsafe act in this module: forget the closure borrow's
         /// lifetime so it can sit in the shared slot.
@@ -136,6 +181,7 @@ impl Pool {
             next: AtomicU32::new(0),
             remaining: AtomicU32::new(n_chunks as u32),
             panicked: AtomicBool::new(false),
+            team,
         });
 
         {
@@ -143,7 +189,11 @@ impl Pool {
             *slot = Some(Arc::clone(&job));
             self.shared.epoch.fetch_add(1, Ordering::Release);
         }
-        self.shared.work_cv.notify_all();
+        // Spinning workers see the epoch bump directly; the kernel wakeup is
+        // only needed (and only paid) for workers parked on the condvar.
+        if self.shared.parked.load(Ordering::Acquire) > 0 {
+            self.shared.work_cv.notify_all();
+        }
 
         // The submitter works too, then waits out stragglers.
         execute_chunks(&job);
@@ -154,11 +204,14 @@ impl Pool {
                 std::hint::spin_loop();
             } else {
                 let g = self.shared.done.lock().unwrap();
+                self.shared.submitter_waiting.store(true, Ordering::Release);
                 if job.remaining.load(Ordering::Acquire) == 0 {
+                    self.shared.submitter_waiting.store(false, Ordering::Release);
                     break;
                 }
                 // Timeout bounds any lost-wakeup window to 1ms.
                 let _ = self.shared.done_cv.wait_timeout(g, Duration::from_millis(1)).unwrap();
+                self.shared.submitter_waiting.store(false, Ordering::Release);
             }
         }
 
@@ -185,11 +238,14 @@ fn worker_loop(shared: &'static Shared) {
                 std::hint::spin_loop();
             } else {
                 let guard = shared.slot.lock().unwrap();
+                // Publish parked-ness under the same mutex the publisher's
+                // epoch bump happens under: the publisher either sees
+                // parked > 0 and notifies, or we see the new epoch here.
+                shared.parked.fetch_add(1, Ordering::Release);
                 if shared.epoch.load(Ordering::Acquire) == seen_epoch {
-                    // Checked under the same mutex the publisher updates
-                    // under, so this wait cannot miss a notify.
                     drop(shared.work_cv.wait(guard).unwrap());
                 }
+                shared.parked.fetch_sub(1, Ordering::Release);
                 spins = 0;
             }
         }
@@ -198,7 +254,11 @@ fn worker_loop(shared: &'static Shared) {
         let job = shared.slot.lock().unwrap().clone();
         if let Some(job) = job {
             execute_chunks(&job);
-            if job.remaining.load(Ordering::Acquire) == 0 {
+            // The submitter normally spin-waits and sees `remaining` hit 0
+            // itself; the kernel notify is only for the parked case.
+            if job.remaining.load(Ordering::Acquire) == 0
+                && shared.submitter_waiting.load(Ordering::Acquire)
+            {
                 let _g = shared.done.lock().unwrap();
                 shared.done_cv.notify_all();
             }

@@ -144,9 +144,26 @@ On an Intel Core Ultra 5 laptop the 0.5B instruct model decodes at ~30 tok/s
 ~1.1 GiB); throughput there is DRAM-bandwidth- and thermal-bound, not
 kernel-bound.
 
+**Two threading modes** share these kernels. The default fans each large
+matmul out on a persistent work-stealing pool, with sub-1M-MAC projections
+kept serial (their measured dispatch cost exceeds their work). `PRANA_TEAM=1`
+switches to llama.cpp's execution model — one dispatch per token, all threads
+walking every layer together with spin barriers between ops (`ggml_barrier`'s
+generation-counter design; ours measures 0.9-2.2µs) and guard-checked shared
+buffers — **bit-identical to the default path by test**. On the hybrid-core
+Windows laptop this was tuned on, the pool path still decodes faster at 0.5B
+scale (the team's members burn power-budget spinning through the serial glue
+sections), so team mode ships as measured, tested groundwork rather than the
+default; `prana teambench` reports the primitive costs on your CPU. The
+remaining distance to llama.cpp on the same file (~85 vs ~30 tok/s, measured
+against Ollama) is threading/scheduling engineering — parallel norms and
+attention glue inside team mode, batched prefill, thread affinity — not
+kernel arithmetic, and not fixable by quantization tricks alone.
+
 Still out of scope: ARM NEON/Metal targets, safetensors, further
 architectures (Phi, Gemma-2 softcapping), exact GPT-2 pre-tokenizer regex,
-and the CQ rotation-codebook quantization; later phases, not built here.
+batched prefill, GPU backends, and the CQ rotation-codebook quantization;
+later phases, not built here.
 
 ## License
 

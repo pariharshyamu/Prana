@@ -104,31 +104,84 @@ pub fn attention_decode(
     assert!(k_cache.len() >= (pos + 1) * kv_stride, "k_cache not filled to pos");
     assert!(v_cache.len() >= (pos + 1) * kv_stride, "v_cache not filled to pos");
 
-    let group = n_heads / n_kv_heads;
-    let scale = 1.0 / (head_dim as f32).sqrt();
     let mut out = vec![0f32; n_heads * head_dim];
-
     for h in 0..n_heads {
-        let kv_h = h / group;
-        let q_vec = &q[h * head_dim..(h + 1) * head_dim];
-
-        let mut scores = vec![0f32; pos + 1];
-        for (t, s) in scores.iter_mut().enumerate() {
-            let k_vec = &k_cache[t * kv_stride + kv_h * head_dim..t * kv_stride + (kv_h + 1) * head_dim];
-            let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
-            *s = dot * scale;
-        }
-        let probs = softmax(&scores);
-
-        let dst = &mut out[h * head_dim..(h + 1) * head_dim];
-        for (t, &p) in probs.iter().enumerate() {
-            let v_vec = &v_cache[t * kv_stride + kv_h * head_dim..t * kv_stride + (kv_h + 1) * head_dim];
-            for (d, &vv) in dst.iter_mut().zip(v_vec) {
-                *d += p * vv;
-            }
-        }
+        decode_one_head(
+            q,
+            k_cache,
+            v_cache,
+            pos,
+            h,
+            n_heads / n_kv_heads,
+            kv_stride,
+            head_dim,
+            &mut out[h * head_dim..(h + 1) * head_dim],
+        );
     }
     out
+}
+
+/// One attention head of a single decode step, written into `dst`
+/// (`head_dim` wide). Shared by the serial and team decode paths.
+#[allow(clippy::too_many_arguments)]
+fn decode_one_head(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    pos: usize,
+    h: usize,
+    group: usize,
+    kv_stride: usize,
+    head_dim: usize,
+    dst: &mut [f32],
+) {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let kv_h = h / group;
+    let q_vec = &q[h * head_dim..(h + 1) * head_dim];
+
+    let mut scores = vec![0f32; pos + 1];
+    for (t, s) in scores.iter_mut().enumerate() {
+        let k_vec = &k_cache[t * kv_stride + kv_h * head_dim..t * kv_stride + (kv_h + 1) * head_dim];
+        let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
+        *s = dot * scale;
+    }
+    let probs = softmax(&scores);
+
+    dst.fill(0.0);
+    for (t, &p) in probs.iter().enumerate() {
+        let v_vec = &v_cache[t * kv_stride + kv_h * head_dim..t * kv_stride + (kv_h + 1) * head_dim];
+        for (d, &vv) in dst.iter_mut().zip(v_vec) {
+            *d += p * vv;
+        }
+    }
+}
+
+/// Team version of [`attention_decode`]: heads are the parallel unit (their
+/// output slices are disjoint `head_dim` runs). Fills `out[..n_heads*head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_decode_team(
+    team: &crate::team::Team,
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    out: &crate::team::TeamCell<Vec<f32>>,
+) {
+    assert_eq!(q.len(), n_heads * head_dim);
+    assert!(n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads));
+    let kv_stride = n_kv_heads * head_dim;
+    assert!(k_cache.len() >= (pos + 1) * kv_stride, "k_cache not filled to pos");
+    assert!(v_cache.len() >= (pos + 1) * kv_stride, "v_cache not filled to pos");
+    let group = n_heads / n_kv_heads;
+
+    // One head scans (pos+1) K rows and V rows of head_dim each.
+    let head_macs = 2 * (pos + 1) * head_dim;
+    crate::team::team_fill_slices(team, out, n_heads, head_dim, head_macs, |h, dst| {
+        decode_one_head(q, k_cache, v_cache, pos, h, group, kv_stride, head_dim, dst);
+    });
 }
 
 /// Causal scaled-dot-product self-attention.
