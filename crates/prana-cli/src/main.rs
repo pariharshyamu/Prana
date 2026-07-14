@@ -93,6 +93,8 @@ fn run() {
     let mut seed = 20260712u64;
     let mut precision = Precision::F32;
     let mut chat_mode = false;
+    let mut draft_path: Option<String> = None;
+    let mut spec_k = 4usize;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -101,6 +103,8 @@ fn run() {
             "--seed" => seed = it.next().and_then(|v| v.parse().ok()).unwrap_or(seed),
             "--q8" => precision = Precision::Q8,
             "--chat" => chat_mode = true,
+            "--draft" => draft_path = it.next().cloned(),
+            "--spec-k" => spec_k = it.next().and_then(|v| v.parse().ok()).unwrap_or(spec_k),
             v => positional.push(v.to_string()),
         }
     }
@@ -165,15 +169,39 @@ fn run() {
         prompt
     };
 
-    // Completion mode echoes the prompt as it prefills; chat mode hides the
-    // template and shows only the assistant's reply.
-    let mut sampler = Sampler::new(temp, seed);
-    let stats = prana_model::generate(&model, tokenizer.as_ref(), &prompt, steps, &mut sampler, |piece, is_prompt| {
+    // Emit hook: completion mode echoes the prompt as it prefills; chat mode
+    // hides the template and shows only the assistant's reply.
+    let emit = |piece: &[u8], is_prompt: bool| {
         if !(chat_mode && is_prompt) {
             std::io::stdout().write_all(piece).ok();
             std::io::stdout().flush().ok();
         }
-    });
+    };
+
+    let stats = if let Some(dp) = &draft_path {
+        // Speculative decoding (greedy): load the draft (GGUF, same vocab).
+        if !dp.ends_with(".gguf") || !is_gguf {
+            eprintln!("--draft requires GGUF target and draft models");
+            std::process::exit(2);
+        }
+        let (draft, _) = gguf::load(std::path::Path::new(dp), precision).unwrap_or_else(|e| {
+            eprintln!("cannot load draft '{dp}': {e}");
+            std::process::exit(1);
+        });
+        if draft.config.vocab_size != model.config.vocab_size {
+            eprintln!(
+                "draft vocab {} != target vocab {} (models must share a tokenizer)",
+                draft.config.vocab_size, model.config.vocab_size
+            );
+            std::process::exit(1);
+        }
+        eprintln!("  (draft {dp}: {} layers, greedy speculative k={spec_k})", draft.config.n_layers);
+        prana_model::generate_speculative(&model, &draft, tokenizer.as_ref(), &prompt, steps, spec_k, emit)
+    } else {
+        let mut sampler = Sampler::new(temp, seed);
+        prana_model::generate(&model, tokenizer.as_ref(), &prompt, steps, &mut sampler, emit)
+    };
+
     println!("\n---\n");
     println!(
         "  {} prompt + {} generated tokens in {:.2}s  ->  {:.1} tok/s",
@@ -182,6 +210,12 @@ fn run() {
         stats.seconds,
         (stats.prompt_tokens + stats.generated_tokens) as f64 / stats.seconds
     );
+    if let Some((proposed, accepted)) = stats.spec {
+        println!(
+            "  speculative       : {accepted}/{proposed} drafts accepted ({:.0}% acceptance)",
+            if proposed > 0 { 100.0 * accepted as f64 / proposed as f64 } else { 0.0 }
+        );
+    }
     if let Some(report) = prana_model::timing_report() {
         print!("{report}");
     }

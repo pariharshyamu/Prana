@@ -33,8 +33,8 @@ mod team;
 mod threading;
 
 pub use attention::{
-    attention, attention_decode, attention_decode_team, f16_kv_write, rope, rope_interleaved,
-    rope_neox, F16KvView,
+    attention, attention_decode, attention_decode_team, attention_verify, f16_kv_write, rope,
+    rope_interleaved, rope_neox, F16KvView,
 };
 pub use kquant::{
     dequant_q40_block, dequant_q4k_block, dequant_q6k_block, matmul_kquant_f32,

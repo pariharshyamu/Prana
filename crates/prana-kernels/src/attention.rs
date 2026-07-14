@@ -283,6 +283,55 @@ pub fn attention(
     out
 }
 
+/// Batched attention for speculative verification: `seq` query rows at
+/// absolute positions `pos0..pos0+seq` each attend to the full f16 KV cache
+/// (rows `0..=pos0+i`, causal). The cache must already hold all `pos0+seq`
+/// K/V rows (verification writes them before calling this). Returns
+/// `[seq, n_heads*head_dim]`.
+///
+/// This is the decode kernel generalized to many query rows at once, reading
+/// from the shared f16 cache — the read that makes verifying k drafted
+/// tokens cost one weight-streaming pass instead of k.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_verify(
+    q: &[f32],
+    k_cache: F16KvView,
+    v_cache: F16KvView,
+    pos0: usize,
+    seq: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    assert_eq!(q.len(), seq * n_heads * head_dim);
+    assert!(n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads));
+    assert!(head_dim <= MAX_HEAD_DIM, "head_dim {head_dim} exceeds cache scratch");
+    let kv_stride = n_kv_heads * head_dim;
+    let q_stride = n_heads * head_dim;
+    let group = n_heads / n_kv_heads;
+    assert!(k_cache.data.len() >= (pos0 + seq) * kv_stride, "cache not filled to pos0+seq");
+
+    let mut out = vec![0f32; seq * q_stride];
+    for i in 0..seq {
+        let pos = pos0 + i; // absolute position of this query row
+        let q_row = &q[i * q_stride..(i + 1) * q_stride];
+        for h in 0..n_heads {
+            decode_one_head(
+                q_row,
+                k_cache,
+                v_cache,
+                pos,
+                h,
+                group,
+                kv_stride,
+                head_dim,
+                &mut out[i * q_stride + h * head_dim..i * q_stride + (h + 1) * head_dim],
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

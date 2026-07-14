@@ -5,9 +5,9 @@
 //! Gemma's √dim embedding scale.
 
 use prana_kernels::{
-    attention, attention_decode, attention_decode_team, f16_kv_write, gelu_tanh, matmul_f32_team,
-    matmul_kquant_team, quantize_acts, rmsnorm, rope_interleaved, rope_neox, run_team, silu,
-    F16KvView, QuantActs, Team, TeamCell,
+    attention, attention_decode, attention_decode_team, attention_verify, f16_kv_write, gelu_tanh,
+    matmul_f32_team, matmul_kquant_team, quantize_acts, rmsnorm, rope_interleaved, rope_neox,
+    run_team, silu, F16KvView, QuantActs, Team, TeamCell,
 };
 
 use crate::checkpoint::{Activation, Embedding, Model};
@@ -285,6 +285,96 @@ pub fn prefill(model: &Model, cache: &mut KvCache, tokens: &[u32]) {
     }
 }
 
+/// Process `tokens` at absolute positions `pos0..pos0+tokens.len()` in one
+/// batched pass, writing their K/V into the cache and returning the logits
+/// for **every** position (`[n, vocab]`). Each position attends to the full
+/// cache (rows `0..=pos0+i`), so the cache must already hold rows `0..pos0`.
+///
+/// This is the speculative-decoding verification kernel: verifying k drafted
+/// tokens costs one weight-streaming pass (each weight row read once for all
+/// k positions) instead of k separate decode steps.
+pub fn forward_batch(model: &Model, cache: &mut KvCache, tokens: &[u32], pos0: usize) -> Vec<f32> {
+    let c = &model.config;
+    let (dim, head_dim, kv_dim, q_dim) = (c.dim, c.head_dim, c.kv_dim(), c.q_dim());
+    let n = tokens.len();
+
+    let mut x = Vec::with_capacity(n * dim);
+    for &t in tokens {
+        x.extend(model.tok_emb.row(t as usize, dim));
+    }
+    if c.emb_scale != 1.0 {
+        for v in x.iter_mut() {
+            *v *= c.emb_scale;
+        }
+    }
+
+    let row_acts = |xs: &[f32], width: usize| -> Vec<QuantActs> {
+        xs.chunks_exact(width).map(quantize_acts).collect()
+    };
+
+    for (l, layer) in model.layers.iter().enumerate() {
+        // --- attention block ---
+        let xb = rmsnorm(&x, &layer.rms_att, n, dim, c.norm_eps);
+        let acts = row_acts(&xb, dim);
+        let mut q = layer.wq.apply_prefill(&xb, &acts);
+        let mut k = layer.wk.apply_prefill(&xb, &acts);
+        let mut v = layer.wv.apply_prefill(&xb, &acts);
+        for t in 0..n {
+            let pos = pos0 + t;
+            add_bias(&mut q[t * q_dim..(t + 1) * q_dim], &layer.bq);
+            add_bias(&mut k[t * kv_dim..(t + 1) * kv_dim], &layer.bk);
+            add_bias(&mut v[t * kv_dim..(t + 1) * kv_dim], &layer.bv);
+            if c.rope_neox {
+                rope_neox(&mut q[t * q_dim..(t + 1) * q_dim], pos, head_dim, c.rope_theta);
+                rope_neox(&mut k[t * kv_dim..(t + 1) * kv_dim], pos, head_dim, c.rope_theta);
+            } else {
+                rope_interleaved(&mut q[t * q_dim..(t + 1) * q_dim], pos, head_dim, c.rope_theta);
+                rope_interleaved(&mut k[t * kv_dim..(t + 1) * kv_dim], pos, head_dim, c.rope_theta);
+            }
+        }
+        // Write the new K/V rows into the cache at their absolute positions,
+        // then attend against the whole cache.
+        f16_kv_write(&mut cache.k[l].get_mut(), pos0, kv_dim, &k);
+        f16_kv_write(&mut cache.v[l].get_mut(), pos0, kv_dim, &v);
+        let attn = {
+            let (ck, cv) = (cache.k[l].read(), cache.v[l].read());
+            let (kv, vv) = (F16KvView { data: &ck }, F16KvView { data: &cv });
+            attention_verify(&q, kv, vv, pos0, n, c.n_heads, c.n_kv_heads, head_dim)
+        };
+        let acts_attn = row_acts(&attn, q_dim);
+        let o = layer.wo.apply_prefill(&attn, &acts_attn);
+        for (xi, oi) in x.iter_mut().zip(o) {
+            *xi += oi;
+        }
+
+        // --- gated MLP block ---
+        let xb = rmsnorm(&x, &layer.rms_ffn, n, dim, c.norm_eps);
+        let acts = row_acts(&xb, dim);
+        let mut gate = layer.w1.apply_prefill(&xb, &acts);
+        let up = layer.w3.apply_prefill(&xb, &acts);
+        match c.act {
+            Activation::Silu => silu(&mut gate),
+            Activation::GeluTanh => gelu_tanh(&mut gate),
+        }
+        for (g, u) in gate.iter_mut().zip(&up) {
+            *g *= u;
+        }
+        let acts_h = row_acts(&gate, c.hidden_dim);
+        let down = layer.w2.apply_prefill(&gate, &acts_h);
+        for (xi, di) in x.iter_mut().zip(down) {
+            *xi += di;
+        }
+    }
+
+    // Classifier for every position.
+    let xb = rmsnorm(&x, &model.rms_final, n, dim, c.norm_eps);
+    let mut logits = Vec::with_capacity(n * c.vocab_size);
+    for row in xb.chunks_exact(dim) {
+        logits.extend(model.logits(row));
+    }
+    logits
+}
+
 /// One token through the model as a **team**: a single pool dispatch per
 /// token, all threads walking every layer together with µs spin barriers
 /// between ops (llama.cpp's `ggml_graph_compute` model). Matmuls and
@@ -462,6 +552,143 @@ pub struct GenStats {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub seconds: f64,
+    /// Speculative decoding only: (draft tokens proposed, tokens accepted).
+    /// `accepted / proposed` is the acceptance rate; the speedup is roughly
+    /// `(accepted + verify_passes) / verify_passes` capped by the cost ratio.
+    pub spec: Option<(usize, usize)>,
+}
+
+/// Greedy argmax of one logits row.
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    for (i, x) in logits.iter().enumerate() {
+        if *x > logits[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// Greedy **speculative decoding**: a small `draft` model proposes `k` tokens
+/// per round, the `target` model verifies all `k` in a single batched pass
+/// ([`forward_batch`]), and the longest correct prefix is accepted. Because
+/// acceptance requires the draft token to equal the target's greedy argmax,
+/// the emitted sequence is **exactly** the target's own greedy decode — just
+/// produced in fewer target passes. Only greedy is supported (temperature
+/// needs rejection sampling; documented as future work).
+///
+/// Both models must share a tokenizer/vocabulary. Returns the same
+/// [`GenStats`] as [`generate`], with `spec` populated.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_speculative(
+    target: &Model,
+    draft: &Model,
+    tokenizer: &dyn Tokenize,
+    prompt: &str,
+    steps: usize,
+    k: usize,
+    mut on_piece: impl FnMut(&[u8], bool),
+) -> GenStats {
+    assert!(k >= 1, "draft length must be >= 1");
+    assert_eq!(
+        target.config.vocab_size, draft.config.vocab_size,
+        "draft and target must share a vocabulary"
+    );
+    let prompt_tokens = tokenizer.encode_prompt(prompt);
+    assert!(!prompt_tokens.is_empty(), "prompt encoded to zero tokens");
+    let max_pos = target.config.seq_len.min(prompt_tokens.len() + steps);
+    let p = prompt_tokens.len();
+
+    let mut tcache = KvCache::with_len(target, max_pos);
+    let mut dcache = KvCache::with_len(draft, max_pos);
+    let start = std::time::Instant::now();
+
+    // Prefill both caches with the prompt except its last token, streaming
+    // the prompt pieces (hidden by chat UIs). After this, cache positions
+    // 0..p-1 hold correct K/V, and `last` (the p-th prompt token, logical
+    // position p-1) has not yet been fed through.
+    if p > 1 {
+        prefill(target, &mut tcache, &prompt_tokens[..p - 1]);
+        prefill(draft, &mut dcache, &prompt_tokens[..p - 1]);
+        for w in prompt_tokens.windows(2) {
+            on_piece(&tokenizer.decode(w[0], w[1]), true);
+        }
+    }
+
+    // Invariant at the top of each round: caches hold correct K/V for
+    // positions 0..pos; `last` is the (uncached) token at logical position
+    // `pos`. Every round writes cache positions starting at `pos`, so any
+    // stale K/V left past a partial accept is always overwritten before it
+    // is attended to.
+    let mut pos = p - 1;
+    let mut last = prompt_tokens[p - 1];
+    let mut generated = 0usize;
+    let (mut proposed, mut accepted) = (0usize, 0usize);
+
+    'outer: while pos + 1 < max_pos {
+        // --- draft: greedily propose up to `budget` tokens from `last` ---
+        // Draft forward at logical position pos+j writes dcache[pos+j].
+        let budget = (max_pos - 1 - pos).min(k);
+        let mut draft_toks = Vec::with_capacity(budget);
+        let mut d_tok = last;
+        for j in 0..budget {
+            let logits = forward(draft, &mut dcache, d_tok, pos + j);
+            d_tok = argmax(&logits);
+            draft_toks.push(d_tok);
+        }
+        proposed += draft_toks.len();
+
+        // --- target: verify [last, draft_toks...] in one batched pass ---
+        // Input row i sits at logical position pos+i; its argmax is the
+        // target's greedy successor of that input. Row 0's successor is the
+        // target's own next token; row i>0's is the successor of
+        // draft_toks[i-1]. So target_next[i] should equal draft_toks[i] for
+        // the draft to be accepted at step i.
+        let mut inputs = Vec::with_capacity(draft_toks.len() + 1);
+        inputs.push(last);
+        inputs.extend_from_slice(&draft_toks);
+        let logits = forward_batch(target, &mut tcache, &inputs, pos);
+        let v = target.config.vocab_size;
+
+        // Walk the predictions: accept while they match the draft, then emit
+        // the first non-matching target token (the correction, or the bonus
+        // token after a full accept) and start the next round from it.
+        for i in 0..=draft_toks.len() {
+            let target_next = argmax(&logits[i * v..(i + 1) * v]);
+
+            if i < draft_toks.len() && target_next == draft_toks[i] {
+                accepted += 1;
+            }
+
+            // Emit `target_next` as the token following logical position
+            // pos+i (its K/V is already in tcache at pos+i, written by
+            // forward_batch, and correct because inputs 0..=i were correct).
+            if tokenizer.is_stop(target_next) {
+                break 'outer;
+            }
+            on_piece(&tokenizer.decode(inputs[i], target_next), false);
+            generated += 1;
+            // Advance: the emitted token becomes `last` at logical pos+i+1.
+            pos += 1;
+            last = target_next;
+            if generated >= steps || pos + 1 >= max_pos {
+                break 'outer;
+            }
+
+            // If the draft diverged here, discard the rest of this batch and
+            // re-draft from the corrected token.
+            if i == draft_toks.len() || target_next != draft_toks[i] {
+                break;
+            }
+        }
+    }
+
+    GenStats {
+        prompt_tokens: p,
+        generated_tokens: generated,
+        seconds: start.elapsed().as_secs_f64(),
+        spec: Some((proposed, accepted)),
+    }
 }
 
 /// Generate up to `steps` tokens continuing `prompt`, streaming each decoded
@@ -541,5 +768,6 @@ pub fn generate(
         prompt_tokens: prompt_tokens.len(),
         generated_tokens: generated,
         seconds: start.elapsed().as_secs_f64(),
+        spec: None,
     }
 }

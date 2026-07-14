@@ -743,6 +743,109 @@ mod tests {
     }
 
     #[test]
+    fn speculative_greedy_equals_plain_greedy() {
+        // The core correctness guarantee: greedy speculative decoding emits
+        // exactly the target's own greedy sequence, regardless of the draft.
+        // Case 1 uses the target as its own draft (near-100% acceptance);
+        // case 2 uses a *different* model as draft (forces rejections), and
+        // both must still match plain greedy target decoding token-for-token.
+        for (draft_arch, note) in [("qwen2", "self-draft"), ("llama", "cross-draft")] {
+            let (target, _) = load_from_bytes(synthetic_model_gguf("qwen2", true, 16));
+            let (draft, _) = if draft_arch == "qwen2" {
+                load_from_bytes(synthetic_model_gguf("qwen2", true, 16)) // identical weights
+            } else {
+                load_from_bytes(synthetic_model_gguf("llama", false, 16)) // different model
+            };
+
+            // A tokenizer whose encode of the prompt yields known ids, and
+            // whose decode is 1:1 with the id so we can compare token streams
+            // through the emitted pieces. Single-byte pieces, no BOS.
+            // Distinct byte per id (0..48 all printable) so an id stream maps
+            // 1:1 to a byte stream — comparing bytes then compares ids exactly.
+            // Pieces are the printable bytes '!'..='!'+47; use a prompt drawn
+            // only from those so encoding never falls back to byte tokens.
+            // BOS/EOS at ids the model's argmax won't pick (verified by the
+            // reference emitting a full `steps`), so neither loop early-stops
+            // and the comparison exercises real generation.
+            let tok = crate::tokenizer::Tokenizer::from_parts(
+                (0..48u8).map(|i| vec![b'!' + i]).collect(),
+                vec![0.0; 48],
+            )
+            .with_special(46, 47, false);
+            let prompt = "&(*"; // '&'=38, '('=40, '*'=42, all in vocab
+            // Context is 16; prompt (BOS + dummy space + 3 chars = ~5 tokens)
+            // plus steps must stay under it.
+            let steps = 8;
+
+            let reference = plain_greedy(&target, &tok, prompt, steps);
+            let mut spec_bytes: Vec<u8> = Vec::new();
+            let stats = crate::generate_speculative(
+                &target, &draft, &tok, prompt, steps, 4,
+                |p, is_prompt| {
+                    if !is_prompt {
+                        spec_bytes.extend_from_slice(p);
+                    }
+                },
+            );
+
+            // Exact-equality guarantee: spec's emitted stream == plain greedy.
+            assert_eq!(spec_bytes, reference, "{note}: spec != plain greedy");
+            let (proposed, accepted) = stats.spec.unwrap();
+            assert!(proposed >= accepted, "{note}: accepted > proposed");
+            if draft_arch == "qwen2" {
+                assert!(accepted > 0, "{note}: self-draft accepted none");
+            }
+        }
+    }
+
+    /// Plain greedy target decode, returning the emitted byte stream (through
+    /// the same tokenizer `generate_speculative` uses, so streams compare).
+    /// Honors is_stop exactly as the real loops do.
+    fn plain_greedy(model: &Model, tok: &crate::tokenizer::Tokenizer, prompt: &str, steps: usize) -> Vec<u8> {
+        use crate::tokenizer::Tokenize;
+        let prompt_tokens = tok.encode_prompt(prompt);
+        let mut cache = crate::KvCache::new(model);
+        let mut bytes = Vec::new();
+        let mut last = prompt_tokens[prompt_tokens.len() - 1];
+        // Prefill 0..p-1 via the loop, decode from the last prompt token.
+        let mut next_from = None;
+        for (pos, &t) in prompt_tokens.iter().enumerate() {
+            let logits = crate::forward(model, &mut cache, t, pos);
+            if pos + 1 == prompt_tokens.len() {
+                next_from = Some(argmax_ref(&logits));
+            }
+        }
+        let mut pos = prompt_tokens.len();
+        let mut generated = 0usize;
+        let mut next = next_from.unwrap();
+        while generated < steps {
+            if tok.is_stop(next) {
+                break;
+            }
+            bytes.extend(tok.decode(last, next));
+            last = next;
+            generated += 1;
+            if generated >= steps {
+                break;
+            }
+            let logits = crate::forward(model, &mut cache, last, pos);
+            next = argmax_ref(&logits);
+            pos += 1;
+        }
+        bytes
+    }
+
+    fn argmax_ref(v: &[f32]) -> u32 {
+        let mut b = 0;
+        for (i, x) in v.iter().enumerate() {
+            if *x > v[b] {
+                b = i;
+            }
+        }
+        b as u32
+    }
+
+    #[test]
     fn qwen2_biases_change_the_output() {
         let (with_bias, _) = load_from_bytes(synthetic_model_gguf("qwen2", true, 16));
         let (no_bias, _) = load_from_bytes(synthetic_model_gguf("qwen2", false, 16));

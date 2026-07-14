@@ -48,7 +48,7 @@ boundary marked `#![forbid(unsafe_code)]`:
 | [`prana-kernels`](crates/prana-kernels) | `matmul` / `quants` / `norms_rope` / `attention` / `threading` | Q8 quantized matmul, dense matmul, RMSNorm, softmax, RoPE, causal grouped-query attention, scoped-thread `parallel_for` |
 | [`prana-graph`](crates/prana-graph) | `CactusGraph` | checked-handle, shape-validating, define-then-run graph |
 | [`prana-cactus`](crates/prana-cactus) | `bindings/rust/cactus.rs` + `cactus_engine.h` | **Phase 0**: safe RAII wrapper over the real Cactus C ABI — `Result` errors, streaming-callback trampoline with panic containment, grow-and-retry buffers; testable everywhere via an in-process mock of the ABI |
-| [`prana-model`](crates/prana-model) | `cactus-engine` model loading / tokenizer / sampling | **real-model inference**: llama2.c *and GGUF* loaders for **llama, qwen2, and gemma** architectures (F32/F16/Q4_0/Q8_0/Q4_K/Q6_K, all quantized types running natively in packed form, embedding rows dequantized per lookup), SentencePiece *and* GPT-2 byte-level BPE tokenizers with control/special tokens, ChatML chat mode, **f16 KV cache** (half the attention-read bandwidth), KV-cached forward pass with QKV biases / NeoX RoPE / GELU / decoupled head_dim, greedy/temperature sampling — zero `unsafe`, zero deps |
+| [`prana-model`](crates/prana-model) | `cactus-engine` model loading / tokenizer / sampling | **real-model inference**: llama2.c *and GGUF* loaders for **llama, qwen2, and gemma** architectures (F32/F16/Q4_0/Q8_0/Q4_K/Q6_K, all quantized types running natively in packed form, embedding rows dequantized per lookup), SentencePiece *and* GPT-2 byte-level BPE tokenizers with control/special tokens, ChatML chat mode, **f16 KV cache** (half the attention-read bandwidth), **greedy speculative decoding** (draft model + batched verify, output-identical to plain greedy), KV-cached forward pass with QKV biases / NeoX RoPE / GELU / decoupled head_dim, greedy/temperature sampling — zero `unsafe`, zero deps |
 | [`prana-cli`](crates/prana-cli) | `cactus run` / `benchmark` / `chat` | real-model text generation (`run`), transformer-block demo, microbenchmark, Phase 0 chat driver |
 
 ### Run it
@@ -75,14 +75,18 @@ cargo run --release -p prana-cli -- run qwen2.5-0.5b-instruct-q4_0.gguf "Who are
 ```
 
 `prana run` options: `[model.bin tokenizer.bin | model.gguf] [prompt]
-[--steps N] [--temp T] [--seed S] [--q8] [--chat]`. With `--temp 0` (greedy)
-the output is token-identical to llama2.c's reference output for the same
-checkpoint — via both container formats — which is the correctness check for
-the whole pipeline (tokenizer, RoPE convention, attention, SwiGLU, SIMD
-kernels). The AVX2+FMA SIMD tier engages automatically when the CPU supports
-it. `--chat` wraps the prompt in the ChatML template instruct models are
-trained on (the `<|im_start|>` markers encode via the tokenizer's control
-tokens and generation stops at `<|im_end|>`).
+[--steps N] [--temp T] [--seed S] [--q8] [--chat] [--draft M.gguf] [--spec-k N]`.
+With `--temp 0` (greedy) the output is token-identical to llama2.c's reference
+output for the same checkpoint — via both container formats — which is the
+correctness check for the whole pipeline (tokenizer, RoPE convention,
+attention, SwiGLU, SIMD kernels). The AVX2+FMA SIMD tier engages automatically
+when the CPU supports it. `--chat` wraps the prompt in the ChatML template
+instruct models are trained on (the `<|im_start|>` markers encode via the
+tokenizer's control tokens and generation stops at `<|im_end|>`). `--draft`
+enables **greedy speculative decoding**: the given (smaller, same-tokenizer)
+model drafts `--spec-k` tokens per round and the main model verifies them in
+one batched pass, accepting the longest correct prefix — provably identical
+output to plain greedy, at a fraction of the target passes (see EVALUATION.md).
 
 To bind `prana-cactus` against the real engine instead of the mock, build
 `libcactus_engine.a` on an ARM/Apple host (`cactus-engine/build.sh` in the
