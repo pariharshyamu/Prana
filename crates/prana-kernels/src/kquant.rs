@@ -168,6 +168,12 @@ impl KQuantMatrix {
         &self.blocks[r * per_row..(r + 1) * per_row]
     }
 
+    /// Integer dot of packed weight row `r` against quantized activations.
+    #[inline]
+    pub fn row_dot(&self, acts: &QuantActs, r: usize) -> f32 {
+        kquant_row_dot(self, acts, r)
+    }
+
     /// Dequantize a single row (token-embedding lookups).
     pub fn dequantize_row(&self, r: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.cols);

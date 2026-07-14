@@ -149,16 +149,17 @@ matmul out on a persistent work-stealing pool, with sub-1M-MAC projections
 kept serial (their measured dispatch cost exceeds their work). `PRANA_TEAM=1`
 switches to llama.cpp's execution model — one dispatch per token, all threads
 walking every layer together with spin barriers between ops (`ggml_barrier`'s
-generation-counter design; ours measures 0.9-2.2µs) and guard-checked shared
-buffers — **bit-identical to the default path by test**. On the hybrid-core
-Windows laptop this was tuned on, the pool path still decodes faster at 0.5B
-scale (the team's members burn power-budget spinning through the serial glue
-sections), so team mode ships as measured, tested groundwork rather than the
-default; `prana teambench` reports the primitive costs on your CPU. The
-remaining distance to llama.cpp on the same file (~85 vs ~30 tok/s, measured
-against Ollama) is threading/scheduling engineering — parallel norms and
-attention glue inside team mode, batched prefill, thread affinity — not
-kernel arithmetic, and not fixable by quantization tricks alone.
+generation-counter design; ours measures 0.9-2.2µs), fused Q|K|V and gate|up
+projections, redundant per-member glue so no thread idles, and guard-checked
+shared buffers — **bit-identical to the default path by test**. On the
+hybrid-core Windows laptop this was tuned on, the pool path still decodes
+faster (measured across glue strategies, split thresholds, spin budgets, and
+`PRANA_PIN=1` P-core affinity), so team mode ships as measured, tested
+groundwork rather than the default; `prana teambench` reports the primitive
+costs on your CPU. The remaining distance to llama.cpp on the same file
+(~85 vs ~30 tok/s against Ollama) needs platform-level scheduling diagnosis
+plus batched prefill — not kernel arithmetic; EVALUATION.md has the full
+measurement story.
 
 Still out of scope: ARM NEON/Metal targets, safetensors, further
 architectures (Phi, Gemma-2 softcapping), exact GPT-2 pre-tokenizer regex,

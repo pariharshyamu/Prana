@@ -39,12 +39,14 @@ pub use kquant::{
     Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, QK_K,
 };
 pub use matmul::{
-    dequantize_q8, matmul_f32, matmul_f32_team, matmul_q8_f32, matmul_q8_team, quantize_acts,
-    quantize_q8, QuantActs, QuantMatrix, Q8_BLOCK,
+    dequantize_q8, dot_f32, matmul_f32, matmul_f32_team, matmul_q8_f32, matmul_q8_team,
+    quantize_acts, quantize_q8, QuantActs, QuantMatrix, Q8_BLOCK,
 };
 pub use norms::{gelu_tanh, rmsnorm, silu, softmax};
 pub use pool::{global as pool, Pool};
-pub use team::{run_team, team_fill_rows, team_fill_slices, Team, TeamCell, TeamCtx};
+pub use team::{
+    run_team, team_fill_rows, team_fill_rows_weighted, team_fill_slices, Team, TeamCell, TeamCtx,
+};
 pub use threading::parallel_for;
 
 /// IEEE 754 half → single conversion (handles subnormals, inf, NaN).

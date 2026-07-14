@@ -6,8 +6,7 @@
 
 use prana_kernels::{
     attention_decode, attention_decode_team, gelu_tanh, matmul_f32_team, matmul_kquant_team,
-    quantize_acts, rmsnorm, rope_interleaved, rope_neox, run_team, silu, QuantActs, Team,
-    TeamCell,
+    quantize_acts, rmsnorm, rope_interleaved, rope_neox, run_team, silu, Team, TeamCell,
 };
 
 use crate::checkpoint::{Activation, Embedding, Model};
@@ -38,39 +37,28 @@ impl KvCache {
     }
 }
 
-/// Preallocated intermediate buffers for `forward_team`, shared across the
-/// team through guard-checked cells.
+/// Shared intermediate buffers for `forward_team` — only the tensors that
+/// parallel ops *write* live here (matmul / attention outputs). Everything
+/// small (norms, rope, activation quantization) is recomputed redundantly
+/// per member on private buffers: a few µs of duplicate arithmetic instead
+/// of a barrier plus idle spinning.
 pub struct Scratch {
-    x: TeamCell<Vec<f32>>,     // residual stream [dim]
-    xb: TeamCell<Vec<f32>>,    // normed input [dim]
-    q: TeamCell<Vec<f32>>,     // [q_dim]
-    k: TeamCell<Vec<f32>>,     // [kv_dim]
-    v: TeamCell<Vec<f32>>,     // [kv_dim]
-    attn: TeamCell<Vec<f32>>,  // [q_dim]
-    o: TeamCell<Vec<f32>>,     // matmul output back into the stream [dim]
-    gate: TeamCell<Vec<f32>>,  // [hidden]
-    up: TeamCell<Vec<f32>>,    // [hidden]
+    qkv: TeamCell<Vec<f32>>,    // fused Q|K|V projection [q_dim + 2*kv_dim]
+    attn: TeamCell<Vec<f32>>,   // attention output [q_dim]
+    o: TeamCell<Vec<f32>>,      // projection back into the stream [dim]
+    gu: TeamCell<Vec<f32>>,     // fused gate|up [2*hidden]
     logits: TeamCell<Vec<f32>>, // [vocab]
-    /// Quantized activations for the current matmul input.
-    acts: TeamCell<QuantActs>,
 }
 
 impl Scratch {
     pub fn new(model: &Model) -> Self {
         let c = &model.config;
-        let empty = || QuantActs { q: Vec::new(), scales: Vec::new(), sums: Vec::new() };
         Self {
-            x: TeamCell::new(vec![0f32; c.dim]),
-            xb: TeamCell::new(vec![0f32; c.dim]),
-            q: TeamCell::new(vec![0f32; c.q_dim()]),
-            k: TeamCell::new(vec![0f32; c.kv_dim()]),
-            v: TeamCell::new(vec![0f32; c.kv_dim()]),
+            qkv: TeamCell::new(vec![0f32; c.q_dim() + 2 * c.kv_dim()]),
             attn: TeamCell::new(vec![0f32; c.q_dim()]),
             o: TeamCell::new(vec![0f32; c.dim]),
-            gate: TeamCell::new(vec![0f32; c.hidden_dim]),
-            up: TeamCell::new(vec![0f32; c.hidden_dim]),
+            gu: TeamCell::new(vec![0f32; 2 * c.hidden_dim]),
             logits: TeamCell::new(vec![0f32; c.vocab_size]),
-            acts: TeamCell::new(empty()),
         }
     }
 }
@@ -215,10 +203,17 @@ pub fn forward_team(
 }
 
 /// The per-member body of [`forward_team`]. Every member runs this whole
-/// function; `serial` and the team kernels internally keep them in step.
-/// Barrier discipline: every member must reach every `serial`/team-kernel
-/// call (no member-dependent control flow around them), and `TeamCell`
-/// read guards live only inside the parallel block that needs them.
+/// function; the team kernels' internal barriers keep them in step.
+///
+/// Structure (A1/A2 of the llama.cpp-gap plan): the *only* shared writes
+/// are the five parallel ops per layer — fused QKV, attention, `wo`, fused
+/// gate|up, `w2` — each a barrier-bracketed team op (≈12 barriers/layer).
+/// All scalar glue (norms, rope, bias, silu·mul, activation quantization,
+/// residual adds) is computed **redundantly by every member** on private
+/// buffers: the inputs are identical, so the results are identical, and a
+/// few µs of duplicated arithmetic beats a barrier plus (nth−1) idle
+/// spinners. TeamCell read guards live only inside the block that needs
+/// them, always dropped before the next team op's entry barrier.
 fn forward_team_member(
     model: &Model,
     cache: &KvCache,
@@ -228,121 +223,119 @@ fn forward_team_member(
     team: &Team,
 ) {
     let c = &model.config;
-    let (dim, head_dim, kv_dim) = (c.dim, c.head_dim, c.kv_dim());
+    let (dim, head_dim, kv_dim, q_dim) = (c.dim, c.head_dim, c.kv_dim(), c.q_dim());
 
-    team.serial(|| {
-        let mut x = scratch.x.get_mut();
-        x.copy_from_slice(&model.tok_emb.row(token as usize, dim));
-        if c.emb_scale != 1.0 {
-            for v in x.iter_mut() {
-                *v *= c.emb_scale;
-            }
+    // Member-private residual stream (identical on every member).
+    let mut x = model.tok_emb.row(token as usize, dim);
+    if c.emb_scale != 1.0 {
+        for v in x.iter_mut() {
+            *v *= c.emb_scale;
         }
-    });
+    }
 
     for (l, layer) in model.layers.iter().enumerate() {
         // --- attention block ---
-        team.serial(|| {
-            let x = scratch.x.read();
-            let xb = rmsnorm(&x, &layer.rms_att, 1, dim, c.norm_eps);
-            *scratch.acts.get_mut() = quantize_acts(&xb);
-            *scratch.xb.get_mut() = xb;
-        });
+        let xb = rmsnorm(&x, &layer.rms_att, 1, dim, c.norm_eps);
+        let acts = quantize_acts(&xb);
         {
-            let xb = scratch.xb.read();
-            let acts = scratch.acts.read();
-            layer.wq.apply_team(team, &xb, &acts, &scratch.q);
-            layer.wk.apply_team(team, &xb, &acts, &scratch.k);
-            layer.wv.apply_team(team, &xb, &acts, &scratch.v);
+            // Q, K and V share the input, so they run as ONE parallel op
+            // over q_dim + 2*kv_dim fused output rows.
+            let (wq, wk, wv) = (&layer.wq, &layer.wk, &layer.wv);
+            prana_kernels::team_fill_rows_weighted(team, &scratch.qkv, q_dim + 2 * kv_dim, dim, |r| {
+                if r < q_dim {
+                    wq.row_dot(&xb, &acts, r)
+                } else if r < q_dim + kv_dim {
+                    wk.row_dot(&xb, &acts, r - q_dim)
+                } else {
+                    wv.row_dot(&xb, &acts, r - q_dim - kv_dim)
+                }
+            });
         }
+        // Redundant per member: bias + rope on private copies.
+        let (mut q, mut k, mut v);
+        {
+            let qkv = scratch.qkv.read();
+            q = qkv[..q_dim].to_vec();
+            k = qkv[q_dim..q_dim + kv_dim].to_vec();
+            v = qkv[q_dim + kv_dim..].to_vec();
+        }
+        add_bias(&mut q, &layer.bq);
+        add_bias(&mut k, &layer.bk);
+        add_bias(&mut v, &layer.bv);
+        if c.rope_neox {
+            rope_neox(&mut q, pos, head_dim, c.rope_theta);
+            rope_neox(&mut k, pos, head_dim, c.rope_theta);
+        } else {
+            rope_interleaved(&mut q, pos, head_dim, c.rope_theta);
+            rope_interleaved(&mut k, pos, head_dim, c.rope_theta);
+        }
+        // The KV cache is the one shared write the glue needs: thread 0
+        // stores its (identical) copy.
         team.serial(|| {
-            let mut q = scratch.q.get_mut();
-            let mut k = scratch.k.get_mut();
-            let mut v = scratch.v.get_mut();
-            add_bias(&mut q, &layer.bq);
-            add_bias(&mut k, &layer.bk);
-            add_bias(&mut v, &layer.bv);
-            if c.rope_neox {
-                rope_neox(&mut q, pos, head_dim, c.rope_theta);
-                rope_neox(&mut k, pos, head_dim, c.rope_theta);
-            } else {
-                rope_interleaved(&mut q, pos, head_dim, c.rope_theta);
-                rope_interleaved(&mut k, pos, head_dim, c.rope_theta);
-            }
             cache.k[l].get_mut()[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&k);
             cache.v[l].get_mut()[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&v);
         });
         {
-            let q = scratch.q.read();
             let (ck, cv) = (cache.k[l].read(), cache.v[l].read());
             attention_decode_team(team, &q, &ck, &cv, pos, c.n_heads, c.n_kv_heads, head_dim, &scratch.attn);
         }
-        team.serial(|| {
-            *scratch.acts.get_mut() = quantize_acts(&scratch.attn.read());
-        });
+        let (attn, acts_attn) = {
+            let a = scratch.attn.read();
+            (a.to_vec(), quantize_acts(&a))
+        };
+        layer.wo.apply_team(team, &attn, &acts_attn, &scratch.o);
         {
-            let attn = scratch.attn.read();
-            let acts = scratch.acts.read();
-            layer.wo.apply_team(team, &attn, &acts, &scratch.o);
+            let o = scratch.o.read();
+            for (xi, oi) in x.iter_mut().zip(o.iter()) {
+                *xi += oi;
+            }
         }
 
         // --- gated MLP block ---
-        team.serial(|| {
-            let mut x = scratch.x.get_mut();
-            for (xi, oi) in x.iter_mut().zip(scratch.o.read().iter()) {
-                *xi += oi;
-            }
-            let xb = rmsnorm(&x, &layer.rms_ffn, 1, dim, c.norm_eps);
-            *scratch.acts.get_mut() = quantize_acts(&xb);
-            *scratch.xb.get_mut() = xb;
-        });
+        let xb = rmsnorm(&x, &layer.rms_ffn, 1, dim, c.norm_eps);
+        let acts = quantize_acts(&xb);
         {
-            let xb = scratch.xb.read();
-            let acts = scratch.acts.read();
-            layer.w1.apply_team(team, &xb, &acts, &scratch.gate);
-            layer.w3.apply_team(team, &xb, &acts, &scratch.up);
+            let hidden = c.hidden_dim;
+            let (w1, w3) = (&layer.w1, &layer.w3);
+            prana_kernels::team_fill_rows_weighted(team, &scratch.gu, 2 * hidden, dim, |r| {
+                if r < hidden {
+                    w1.row_dot(&xb, &acts, r)
+                } else {
+                    w3.row_dot(&xb, &acts, r - hidden)
+                }
+            });
         }
-        team.serial(|| {
-            let mut gate = scratch.gate.get_mut();
+        // Redundant per member: gate activation, elementwise product,
+        // re-quantization for the down projection.
+        let (hb, acts_h) = {
+            let gu = scratch.gu.read();
+            let mut g = gu[..c.hidden_dim].to_vec();
             match c.act {
-                Activation::Silu => silu(&mut gate),
-                Activation::GeluTanh => gelu_tanh(&mut gate),
+                Activation::Silu => silu(&mut g),
+                Activation::GeluTanh => gelu_tanh(&mut g),
             }
-            for (g, u) in gate.iter_mut().zip(scratch.up.read().iter()) {
-                *g *= u;
+            for (gi, ui) in g.iter_mut().zip(gu[c.hidden_dim..].iter()) {
+                *gi *= ui;
             }
-            *scratch.acts.get_mut() = quantize_acts(&gate);
-        });
+            let acts_h = quantize_acts(&g);
+            (g, acts_h)
+        };
+        layer.w2.apply_team(team, &hb, &acts_h, &scratch.o);
         {
-            let gate = scratch.gate.read();
-            let acts = scratch.acts.read();
-            layer.w2.apply_team(team, &gate, &acts, &scratch.o);
-        }
-        team.serial(|| {
-            let mut x = scratch.x.get_mut();
-            for (xi, oi) in x.iter_mut().zip(scratch.o.read().iter()) {
+            let o = scratch.o.read();
+            for (xi, oi) in x.iter_mut().zip(o.iter()) {
                 *xi += oi;
             }
-        });
+        }
     }
 
     // --- classifier ---
-    team.serial(|| {
-        let x = scratch.x.read();
-        let xb = rmsnorm(&x, &model.rms_final, 1, dim, c.norm_eps);
-        *scratch.acts.get_mut() = quantize_acts(&xb);
-        *scratch.xb.get_mut() = xb;
-    });
-    {
-        let xb = scratch.xb.read();
-        let acts = scratch.acts.read();
-        match (&model.wcls, &model.tok_emb) {
-            (Some(cls), _) => cls.apply_team(team, &xb, &acts, &scratch.logits),
-            (None, Embedding::F32(w)) => {
-                matmul_f32_team(team, &xb, w, c.vocab_size, &scratch.logits)
-            }
-            (None, Embedding::KQuant(m)) => matmul_kquant_team(team, &acts, m, &scratch.logits),
-        }
+    let xb = rmsnorm(&x, &model.rms_final, 1, dim, c.norm_eps);
+    let acts = quantize_acts(&xb);
+    match (&model.wcls, &model.tok_emb) {
+        (Some(cls), _) => cls.apply_team(team, &xb, &acts, &scratch.logits),
+        (None, Embedding::F32(w)) => matmul_f32_team(team, &xb, w, c.vocab_size, &scratch.logits),
+        (None, Embedding::KQuant(m)) => matmul_kquant_team(team, &acts, m, &scratch.logits),
     }
 }
 

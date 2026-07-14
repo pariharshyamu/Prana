@@ -217,10 +217,14 @@ struct SendPtr(*mut f32);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
+/// Below this much total work a split costs more than it saves: the two
+/// bracketing barriers exist either way, and a split's exit waits on the
+/// slowest (E-)core, so tiny ops run whole on thread 0.
+const MIN_MACS_TO_SPLIT: usize = 32 * 1024;
+
 /// Fill `n_slices` disjoint `width`-wide slices of `out` across the team:
 /// `f(i, slice)` writes slice `i` (attention heads, norm rows, ...).
-/// `slice_macs` estimates one slice's work — small totals run whole on
-/// thread 0 (see [`team_fill_rows_weighted`]).
+/// `slice_macs` estimates one slice's work.
 pub fn team_fill_slices(
     team: &Team,
     out: &TeamCell<Vec<f32>>,
@@ -229,27 +233,39 @@ pub fn team_fill_slices(
     slice_macs: usize,
     f: impl Fn(usize, &mut [f32]),
 ) {
+    // Entry barrier BEFORE touching the cell: members drop their previous
+    // phase's read guards before arriving here, so the writer_ptr guard
+    // check cannot race a slow member's still-live guard.
+    if team.ith == 0 {
+        team.ctx.steal.store(team.nth as u32, Ordering::Relaxed);
+    }
+    team.barrier();
     let (ptr, len) = out.writer_ptr();
     assert!(n_slices * width <= len, "output cell too small");
-    const MIN_MACS_TO_SPLIT: usize = 1 << 20;
+
     if n_slices * slice_macs < MIN_MACS_TO_SPLIT {
-        team.serial(|| {
+        if team.ith == 0 {
             // SAFETY: exclusive — thread 0 only, between barriers, no
-            // guards live (writer_ptr checked).
+            // guards live (writer_ptr checked after the entry barrier).
             let slot = unsafe { std::slice::from_raw_parts_mut(ptr.0, n_slices * width) };
             for (i, s) in slot.chunks_exact_mut(width).enumerate() {
                 f(i, s);
             }
-        });
+        }
+        team.barrier();
         return;
     }
-    team.for_chunks(n_slices, |i| {
-        // SAFETY: chunk indices are handed out exactly once, so the
-        // [i*width, (i+1)*width) ranges are disjoint; no guards are live;
-        // the exit barrier orders writes before subsequent readers.
+
+    let mut i = team.ith;
+    while i < n_slices {
+        // SAFETY: the steal counter hands out each index exactly once, so
+        // the [i*width, (i+1)*width) ranges are disjoint; no guards are
+        // live; the exit barrier orders writes before subsequent readers.
         let slot = unsafe { std::slice::from_raw_parts_mut(ptr.0.add(i * width), width) };
         f(i, slot);
-    });
+        i = team.ctx.steal.fetch_add(1, Ordering::Relaxed) as usize;
+    }
+    team.barrier();
 }
 
 /// Fill `out[..n_rows]` with `dot(r)`, split across the team with work
@@ -259,10 +275,9 @@ pub fn team_fill_rows(team: &Team, out: &TeamCell<Vec<f32>>, n_rows: usize, dot:
     team_fill_rows_weighted(team, out, n_rows, 1, dot)
 }
 
-/// [`team_fill_rows`] with an explicit per-row cost (`k` MACs): ops too
-/// small to amortize a split run whole on thread 0 — a split's exit barrier
-/// waits on the slowest member, and on hybrid parts a 16-row chunk on an
-/// E-core outlasts thread 0 doing all 128 rows itself.
+/// [`team_fill_rows`] with an explicit per-row cost (`k` MACs) for the
+/// split-vs-thread-0 decision. Barrier discipline as in
+/// [`team_fill_slices`]: entry barrier first, then the guard check.
 pub fn team_fill_rows_weighted(
     team: &Team,
     out: &TeamCell<Vec<f32>>,
@@ -270,45 +285,46 @@ pub fn team_fill_rows_weighted(
     row_macs: usize,
     dot: impl Fn(usize) -> f32 + Sync,
 ) {
-    if n_rows == 0 {
-        team.barrier();
-        team.barrier();
-        return;
-    }
-    let (ptr, len) = out.writer_ptr();
-    assert!(n_rows <= len, "output cell too small");
-
-    // Same crossover the pool path measured: below ~1M MACs the split
-    // costs more than the work.
-    const MIN_MACS_TO_SPLIT: usize = 1 << 20;
-    if n_rows * row_macs < MIN_MACS_TO_SPLIT {
-        team.serial(|| {
-            // SAFETY: exclusive by construction — only thread 0 runs this,
-            // between barriers; no guards are live (writer_ptr checked).
-            let slot = unsafe { std::slice::from_raw_parts_mut(ptr.0, n_rows) };
-            for (r, o) in slot.iter_mut().enumerate() {
-                *o = dot(r);
-            }
-        });
-        return;
-    }
-
     // ~4 chunks per member smooths P/E-core imbalance without shrinking
     // chunks below prefetch-friendly runs.
     let chunk = n_rows.div_ceil(team.nth * 4).max(16);
     let n_chunks = n_rows.div_ceil(chunk);
-    team.for_chunks(n_chunks, |c| {
+
+    if team.ith == 0 {
+        team.ctx.steal.store(team.nth as u32, Ordering::Relaxed);
+    }
+    team.barrier();
+    let (ptr, len) = out.writer_ptr();
+    assert!(n_rows <= len, "output cell too small");
+
+    if n_rows * row_macs < MIN_MACS_TO_SPLIT {
+        if team.ith == 0 {
+            // SAFETY: exclusive — thread 0 only, between barriers, no
+            // guards live (writer_ptr checked after the entry barrier).
+            let slot = unsafe { std::slice::from_raw_parts_mut(ptr.0, n_rows) };
+            for (r, o) in slot.iter_mut().enumerate() {
+                *o = dot(r);
+            }
+        }
+        team.barrier();
+        return;
+    }
+
+    let mut c = team.ith;
+    while c < n_chunks {
         let start = c * chunk;
         let n = chunk.min(n_rows - start);
-        // SAFETY: for_chunks hands out each chunk index exactly once, so
+        // SAFETY: the steal counter hands out each chunk exactly once, so
         // [start, start+n) ranges are disjoint across writers; no guards
-        // are live (writer_ptr checked); the exit barrier orders these
-        // writes before any subsequent reader.
+        // are live (writer_ptr checked after the entry barrier); the exit
+        // barrier orders these writes before any subsequent reader.
         let slot = unsafe { std::slice::from_raw_parts_mut(ptr.0.add(start), n) };
         for (i, o) in slot.iter_mut().enumerate() {
             *o = dot(start + i);
         }
-    });
+        c = team.ctx.steal.fetch_add(1, Ordering::Relaxed) as usize;
+    }
+    team.barrier();
 }
 
 pub struct TeamCellMut<'a, T> {

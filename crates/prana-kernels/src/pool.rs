@@ -108,6 +108,36 @@ pub struct Pool {
 // larger budget (tried at 2M) measurably *lowered* decode throughput.
 const SPIN_ITERS: u32 = 200_000;
 
+/// Opt-in (`PRANA_PIN=1`, Windows x86_64): pin pool thread `i` to logical
+/// processor `2*i`. On hybrid Intel parts the P-core hyperthread pairs
+/// enumerate first, so this lands one member per physical P-core and keeps
+/// the OS from parking barrier-synchronized members on E/LPE cores — every
+/// barrier and every redundant-glue section is priced at the *slowest*
+/// member, so one straggler taxes the whole team. Heuristic, not topology
+/// detection; that's why it is opt-in.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn pin_current_thread(i: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("PRANA_PIN").is_ok()) {
+        return;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> *mut core::ffi::c_void;
+        fn SetThreadAffinityMask(thread: *mut core::ffi::c_void, mask: usize) -> usize;
+    }
+    let cpu = (2 * i) % usize::BITS as usize;
+    // SAFETY: both calls take only the pseudo-handle for the calling thread
+    // and a bitmask; no memory is passed. A failed call (mask outside the
+    // process affinity) returns 0 and changes nothing.
+    unsafe {
+        SetThreadAffinityMask(GetCurrentThread(), 1usize << cpu);
+    }
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+fn pin_current_thread(_i: usize) {}
+
 impl Pool {
     fn new(threads: usize) -> Self {
         let shared: &'static Shared = Box::leak(Box::new(Shared {
@@ -120,10 +150,14 @@ impl Pool {
             submitter_waiting: AtomicBool::new(false),
             submit: Mutex::new(()),
         }));
-        for _ in 1..threads {
+        pin_current_thread(0);
+        for i in 1..threads {
             thread::Builder::new()
                 .name("prana-pool".into())
-                .spawn(move || worker_loop(shared))
+                .spawn(move || {
+                    pin_current_thread(i);
+                    worker_loop(shared)
+                })
                 .expect("spawn pool worker");
         }
         Self { shared, threads }

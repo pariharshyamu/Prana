@@ -181,14 +181,24 @@ implements both: the default pool path keeps sub-1M-MAC projections serial
 and only fans out FFN/head matmuls, and `PRANA_TEAM=1` enables a faithful
 ggml-style team mode (`team.rs`: generation-counter barriers at 0.9-2.2µs,
 atomic work stealing, guard-checked `TeamCell` buffers, poison-on-panic) that
-is **bit-identical to the classic path** by test. On this hybrid-core Windows
-machine the team mode still loses (~21 vs ~29 tok/s): its win condition is
-all threads working through every op, but norms/rope/bias glue and the small
-projections stay serial at 0.5B scale, so 7 members busy-spin through those
-sections and the spinning eats the package power budget the working cores
-need. Closing the rest of the gap is scheduling engineering (parallelized
-glue, batched prefill, affinity), documented as future work — the kernels
-themselves already run llama.cpp's int8 arithmetic.
+is **bit-identical to the classic path** by test. The team walk is fully
+optimized in the ways theory suggested: fused Q|K|V and gate|up ops (one
+parallel op each), all scalar glue (norms, rope, silu·mul, activation
+quantization, residual adds) computed redundantly per member on private
+buffers so no member ever idles, ~12 barriers per layer, and an opt-in
+P-core affinity pin (`PRANA_PIN=1`). Every variant was A/B-measured
+same-session against the pool path on the hybrid-core Windows laptop:
+serial glue ~21, redundant glue ~17, +pinning ~16 — versus ~21-22 for the
+classic pool path under the same thermal load. Conclusion, held honestly:
+**on this Windows hybrid machine, barrier-lockstep execution loses to
+per-op dispatch**, even though the same design is why llama.cpp is fast —
+their ~85 tok/s on this exact file and machine proves the headroom exists,
+but capturing it needs platform-level scheduling diagnosis (ETW tracing of
+where members stall; OpenMP-style adaptive barriers) rather than more
+kernel work. The next levers that do NOT depend on lockstep: batched
+prefill (their 328 vs our ~30 tok/s prompt phase), f16 KV cache, AVX-VNNI
+dots, and speculative decoding — the one lever that can put effective
+decode throughput *above* llama.cpp's.
 
 Everything above the kernel boundary is `#![forbid(unsafe_code)]`; the Phase 0
 crate concentrates the workspace's entire `unsafe` FFI surface into one

@@ -42,6 +42,14 @@ impl QuantMatrix {
         self.cols / Q8_BLOCK
     }
 
+    /// Integer dot of weight row `r` against quantized activations.
+    #[inline]
+    pub fn row_dot(&self, acts: &QuantActs, r: usize) -> f32 {
+        let k = self.cols;
+        let gpr = self.groups_per_row();
+        dot_q8_q8(acts, &self.q[r * k..(r + 1) * k], &self.scales[r * gpr..(r + 1) * gpr])
+    }
+
     /// Bytes of weight storage — the whole point of quantizing.
     pub fn stored_bytes(&self) -> usize {
         self.q.len() + self.scales.len() * 4
@@ -290,7 +298,7 @@ where
 
 /// Dense dot product: SIMD tier when the CPU supports it, scalar otherwise.
 #[inline]
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     if crate::simd_x86::available() {
         // SAFETY: available() verified AVX2+FMA support on this CPU.
         return unsafe { crate::simd_x86::dot_f32(a, b) };

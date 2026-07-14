@@ -13,7 +13,7 @@ use std::io;
 use std::path::Path;
 
 use prana_kernels::{
-    matmul_f32, matmul_f32_team, matmul_kquant_f32, matmul_kquant_team, matmul_q8_f32,
+    dot_f32, matmul_f32, matmul_f32_team, matmul_kquant_f32, matmul_kquant_team, matmul_q8_f32,
     matmul_q8_team, quantize_q8, KQuantMatrix, QuantActs, QuantMatrix, Team, TeamCell, Q8_BLOCK,
 };
 
@@ -109,6 +109,27 @@ impl Linear {
             }
             Linear::Q8(qm) => matmul_q8_team(team, acts, qm, out),
             Linear::KQuant(km) => matmul_kquant_team(team, acts, km, out),
+        }
+    }
+
+    /// Output rows (the projection's fan-out).
+    pub fn rows(&self) -> usize {
+        match self {
+            Linear::F32 { rows, .. } => *rows,
+            Linear::Q8(qm) => qm.rows,
+            Linear::KQuant(km) => km.rows,
+        }
+    }
+
+    /// One output element: weight row `r` dotted with the activation
+    /// (`x` dense, `acts` its quantized form — see `apply_team`). Lets
+    /// callers fuse several projections into one parallel op.
+    #[inline]
+    pub fn row_dot(&self, x: &[f32], acts: &QuantActs, r: usize) -> f32 {
+        match self {
+            Linear::F32 { w, cols, .. } => dot_f32(x, &w[r * cols..(r + 1) * cols]),
+            Linear::Q8(qm) => qm.row_dot(acts, r),
+            Linear::KQuant(km) => km.row_dot(acts, r),
         }
     }
 
