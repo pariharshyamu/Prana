@@ -366,13 +366,11 @@ pub fn forward_batch(model: &Model, cache: &mut KvCache, tokens: &[u32], pos0: u
         }
     }
 
-    // Classifier for every position.
+    // Classifier for every position, batched: the LM head streams once for
+    // all n rows (row-outer), not once per row — the difference between
+    // verifying k tokens for one head-stream vs k.
     let xb = rmsnorm(&x, &model.rms_final, n, dim, c.norm_eps);
-    let mut logits = Vec::with_capacity(n * c.vocab_size);
-    for row in xb.chunks_exact(dim) {
-        logits.extend(model.logits(row));
-    }
-    logits
+    model.logits_batch(&xb, n)
 }
 
 /// One token through the model as a **team**: a single pool dispatch per

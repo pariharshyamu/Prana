@@ -230,28 +230,46 @@ micro-optimization has stopped paying; the levers that remain change
 bytes-moved (done: packed weights, f16 KV) or tokens-per-pass (speculative
 decoding).
 
-**Speculative decoding** (`--draft <model.gguf> [--spec-k N]`) is the
-tokens-per-pass lever, and the only one that can push *effective* decode
-throughput past a memory-bandwidth wall: a small draft model proposes N
-tokens greedily, the target verifies all N in one batched pass
-(`forward_batch`, weight-row-outer so each target weight is streamed once for
-all N positions), and the longest matching prefix is accepted. Because
+**Speculative decoding** (`--draft <model.gguf> [--spec-k N]`): a small draft
+model proposes N tokens greedily, the target verifies all N in one batched
+pass (`forward_batch`, weight-row-outer so each target weight streams once for
+all N positions, and the LM head — the largest matrix — batched via
+`logits_batch`), and the longest matching prefix is accepted. Because
 acceptance requires the draft token to equal the target's own greedy argmax,
-the emitted stream is **provably identical to plain greedy target decoding**
-— asserted by a byte-for-byte test against a reference greedy loop, with both
-a self-draft (high acceptance) and a cross-model draft (forced rejections),
-and confirmed on the real Qwen2.5-0.5B (drafting for itself: byte-identical
-output, 42% acceptance at k=4). Only greedy is implemented; matching a
-temperature target needs rejection sampling (documented, not built). The
-speedup is real only with a genuinely cheaper draft that shares the target's
-tokenizer — the honest catch this environment hit is that the locally
-available 7B (Qwen2.5-Coder) has a *padded* vocab (152064 vs the 0.5B's
-151936), so the CLI's vocab-match guard correctly refuses to pair them. With
-a matched pair (e.g. a 0.5B drafting for a 7B of the same family/tokenizer),
-42%-acceptance at k=4 yields ~2.4 accepted tokens per target pass, i.e.
-~2.4x effective decode when the draft cost is negligible against the target.
-The mechanism and the exactness guarantee are done and tested; demonstrating
-the wall-clock win just needs a same-tokenizer draft/target pair on disk.
+the emitted stream is **provably identical to plain greedy target decoding** —
+asserted by a byte-for-byte test against a reference greedy loop, with both a
+self-draft (high acceptance) and a cross-model draft (forced rejections). Only
+greedy is implemented; a temperature target needs rejection sampling (not
+built).
+
+**Measured result — and why it is negative on this machine.** With a genuine
+pair (Qwen2.5-0.5B drafting for Qwen2.5-3B-Instruct, same 151936 vocab, so the
+vocab guard accepts), on a 4-core Core Ultra 5: baseline 3B greedy = 2.7 tok/s;
+speculative = **1.0 tok/s** — 2.7× *slower*, output byte-identical. Even at
+88% draft acceptance (k=2) it lost. Per-round timing told the story: a draft
+of 4 (on the 0.5B) costs ~105 ms, but verifying 5 positions on the 3B costs
+~1340 ms — i.e. **~268 ms/position vs ~370 ms for a single 3B decode**.
+Batching the verify saved only ~1.4×, not the ~5× the textbook assumes,
+because at these matrix sizes on this CPU **decode is compute-bound, not
+memory-bandwidth-bound**: processing 5 positions does ~5× the integer MACs, and
+the weight-reuse from batching only saves memory traffic, which is not the
+bottleneck. At 8 threads the per-position verify cost (~201 ms) actually
+*exceeds* the single-token decode (~189 ms) — batching gives essentially zero
+benefit. Speculative decoding's speedup is predicated on the target being
+bandwidth-bound (verifying N tokens ≈ the cost of one weight stream); this
+laptop's weak per-core throughput (~30 GFLOP/s across 4 cores even with
+AVX-VNNI) puts a 3B q4 model on the *compute* side of that line, so the
+technique cannot win here. It would help on a machine whose memory bandwidth is
+low relative to its compute (many-core servers, or GPUs), and against a much
+larger target where the draft cost is negligible and the target is more clearly
+bandwidth-bound. The mechanism and the exactness guarantee are correct and
+tested; the honest conclusion is that **this specific machine has already hit
+its compute wall, not just its bandwidth wall**, so no decode-side software
+lever — speculative included — moves the 3B number here. The remaining real
+lever is the one flagged for the team path: extracting llama.cpp-level
+multi-core scaling from the same silicon (it reaches ~85 tok/s on a 0.5B on
+this box where Prana reaches ~30), which is a thread-scheduling problem, not an
+arithmetic one.
 
 Everything above the kernel boundary is `#![forbid(unsafe_code)]`; the Phase 0
 crate concentrates the workspace's entire `unsafe` FFI surface into one

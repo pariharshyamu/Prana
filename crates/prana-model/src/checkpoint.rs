@@ -246,6 +246,23 @@ impl Model {
             (None, Embedding::KQuant(m)) => matmul_kquant_f32(x, m, 1),
         }
     }
+
+    /// Batched classifier for `n` hidden states `[n, dim]`, returning
+    /// `[n, vocab]`. Runs the **weight-row-outer** path so the LM head — the
+    /// single largest weight matrix — is streamed from DRAM once for all `n`
+    /// rows, not once per row. This is the matmul that dominates speculative
+    /// verification, so batching it is what makes verifying k tokens cost one
+    /// LM-head stream instead of k.
+    pub fn logits_batch(&self, xs: &[f32], n: usize) -> Vec<f32> {
+        let (dim, vocab) = (self.config.dim, self.config.vocab_size);
+        debug_assert_eq!(xs.len(), n * dim);
+        let acts: Vec<QuantActs> = xs.chunks_exact(dim).map(prana_kernels::quantize_acts).collect();
+        match (&self.wcls, &self.tok_emb) {
+            (Some(c), _) => c.apply_prefill(xs, &acts),
+            (None, Embedding::F32(w)) => matmul_f32(xs, w, n, dim, vocab),
+            (None, Embedding::KQuant(m)) => matmul_kquant_prefill(&acts, m),
+        }
+    }
 }
 
 /// Sequential little-endian reader over the checkpoint bytes.
