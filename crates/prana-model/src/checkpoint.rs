@@ -13,8 +13,9 @@ use std::io;
 use std::path::Path;
 
 use prana_kernels::{
-    dot_f32, matmul_f32, matmul_f32_team, matmul_kquant_f32, matmul_kquant_team, matmul_q8_f32,
-    matmul_q8_team, quantize_q8, KQuantMatrix, QuantActs, QuantMatrix, Team, TeamCell, Q8_BLOCK,
+    dot_f32, matmul_f32, matmul_f32_team, matmul_kquant_f32, matmul_kquant_prefill,
+    matmul_kquant_team, matmul_q8_f32, matmul_q8_prefill, matmul_q8_team, quantize_q8,
+    KQuantMatrix, QuantActs, QuantMatrix, Team, TeamCell, Q8_BLOCK,
 };
 
 /// MLP gate activation.
@@ -130,6 +131,17 @@ impl Linear {
             Linear::F32 { w, cols, .. } => dot_f32(x, &w[r * cols..(r + 1) * cols]),
             Linear::Q8(qm) => qm.row_dot(acts, r),
             Linear::KQuant(km) => km.row_dot(acts, r),
+        }
+    }
+
+    /// Batched `apply` for prefill: `xs` is `[n, cols]`, `acts` one
+    /// quantized row per token. Quantized weights use the row-outer kernels
+    /// (weight rows stream once for the whole batch); output `[n, rows]`.
+    pub fn apply_prefill(&self, xs: &[f32], acts: &[QuantActs]) -> Vec<f32> {
+        match self {
+            Linear::F32 { w, rows, cols } => matmul_f32(xs, w, acts.len(), *cols, *rows),
+            Linear::Q8(qm) => matmul_q8_prefill(acts, qm),
+            Linear::KQuant(km) => matmul_kquant_prefill(acts, km),
         }
     }
 

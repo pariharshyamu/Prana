@@ -325,6 +325,13 @@ pub(crate) fn kquant_row_dot(m: &KQuantMatrix, acts: &QuantActs, r: usize) -> f3
     }
 }
 
+/// Prefill matmul over a batch of quantized activation rows, weight-row
+/// outer (each packed row streams once for all tokens). See
+/// [`crate::matmul_q8_prefill`]. Output `[n_tokens, rows]`.
+pub fn matmul_kquant_prefill(acts: &[QuantActs], m: &KQuantMatrix) -> Vec<f32> {
+    crate::matmul::run_rows_multi(m.rows, acts.len(), m.cols, |r, t| kquant_row_dot(m, &acts[t], r))
+}
+
 /// Team version of [`matmul_kquant_f32`] for one activation row: fills
 /// `out[..rows]` across the team, no dispatch — barriers only.
 pub fn matmul_kquant_team(team: &crate::team::Team, acts: &QuantActs, m: &KQuantMatrix, out: &crate::team::TeamCell<Vec<f32>>) {

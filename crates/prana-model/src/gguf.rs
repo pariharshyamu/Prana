@@ -712,6 +712,28 @@ mod tests {
     }
 
     #[test]
+    fn batched_prefill_is_bit_identical_to_sequential() {
+        // Prefill the same prompt batched and token-by-token; the caches
+        // must agree exactly, shown by identical logits at the next step.
+        for arch in ["llama", "qwen2"] {
+            let (model, _) = load_from_bytes(synthetic_model_gguf(arch, arch == "qwen2", 16));
+            let toks: Vec<u32> = vec![3, 9, 14, 7, 21];
+
+            let mut seq_cache = crate::KvCache::new(&model);
+            for (pos, &t) in toks.iter().enumerate() {
+                crate::forward(&model, &mut seq_cache, t, pos);
+            }
+            let seq_logits = crate::forward(&model, &mut seq_cache, 5, toks.len());
+
+            let mut batch_cache = crate::KvCache::new(&model);
+            crate::prefill(&model, &mut batch_cache, &toks);
+            let batch_logits = crate::forward(&model, &mut batch_cache, 5, toks.len());
+
+            assert_eq!(seq_logits, batch_logits, "{arch} prefill diverged");
+        }
+    }
+
+    #[test]
     fn qwen2_biases_change_the_output() {
         let (with_bias, _) = load_from_bytes(synthetic_model_gguf("qwen2", true, 16));
         let (no_bias, _) = load_from_bytes(synthetic_model_gguf("qwen2", false, 16));

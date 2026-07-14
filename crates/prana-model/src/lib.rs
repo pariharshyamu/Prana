@@ -15,7 +15,7 @@ pub mod sampler;
 pub mod tokenizer;
 
 pub use checkpoint::{Activation, Config, Model, Precision};
-pub use infer::{forward, forward_team, generate, timing_report, GenStats, KvCache, Scratch};
+pub use infer::{forward, forward_team, generate, prefill, timing_report, GenStats, KvCache, Scratch};
 pub use sampler::Sampler;
 pub use tokenizer::{AnyTokenizer, Tokenize, Tokenizer};
 

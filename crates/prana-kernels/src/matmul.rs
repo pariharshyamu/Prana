@@ -177,6 +177,60 @@ pub fn matmul_q8_f32(a: &[f32], w: &QuantMatrix, n_tokens: usize) -> Vec<f32> {
     out
 }
 
+/// Prefill matmul over a batch of already-quantized activation rows, with
+/// the **weight-row-outer** loop order: each weight row is streamed from
+/// DRAM once and dotted against every token while it sits in cache. That
+/// reads `n_tokens`× less weight memory than running the tokens one by one
+/// — the reason batched prompt processing is fast. Output `[n_tokens, rows]`.
+pub fn matmul_q8_prefill(acts: &[QuantActs], w: &QuantMatrix) -> Vec<f32> {
+    run_rows_multi(w.rows, acts.len(), w.cols, |r, t| w.row_dot(&acts[t], r))
+}
+
+/// Row-outer batched driver shared by the prefill matmuls: computes the
+/// row-major transpose `[rows, n_tokens]` in parallel disjoint row chunks,
+/// then flips it to `[n_tokens, rows]`.
+pub(crate) fn run_rows_multi(
+    n_rows: usize,
+    n_tokens: usize,
+    k: usize,
+    dot: impl Fn(usize, usize) -> f32 + Sync,
+) -> Vec<f32> {
+    let mut out_t = vec![0f32; n_rows * n_tokens];
+    let pool = crate::pool::global();
+    const MIN_MACS_FOR_THREADS: usize = 1 << 20;
+
+    if n_rows * n_tokens * k < MIN_MACS_FOR_THREADS || pool.threads == 1 {
+        for r in 0..n_rows {
+            for t in 0..n_tokens {
+                out_t[r * n_tokens + t] = dot(r, t);
+            }
+        }
+    } else {
+        let row_chunk = n_rows.div_ceil(pool.threads * 4).max(4);
+        let chunks: Vec<Mutex<(usize, &mut [f32])>> = out_t
+            .chunks_mut(row_chunk * n_tokens)
+            .enumerate()
+            .map(|(i, slot)| Mutex::new((i * row_chunk, slot)))
+            .collect();
+        pool.run(chunks.len(), &|ci| {
+            let mut guard = chunks[ci].lock().unwrap();
+            let (r0, slot) = &mut *guard;
+            for (i, o) in slot.iter_mut().enumerate() {
+                *o = dot(*r0 + i / n_tokens, i % n_tokens);
+            }
+        });
+    }
+
+    // Transpose to token-major (n_tokens is small; this is microseconds).
+    let mut out = vec![0f32; n_rows * n_tokens];
+    for r in 0..n_rows {
+        for t in 0..n_tokens {
+            out[t * n_rows + r] = out_t[r * n_tokens + t];
+        }
+    }
+    out
+}
+
 /// Team version of [`matmul_q8_f32`] for one already-quantized activation
 /// row (barriers only, no pool dispatch).
 pub fn matmul_q8_team(team: &crate::team::Team, acts: &QuantActs, w: &QuantMatrix, out: &crate::team::TeamCell<Vec<f32>>) {

@@ -195,10 +195,19 @@ per-op dispatch**, even though the same design is why llama.cpp is fast —
 their ~85 tok/s on this exact file and machine proves the headroom exists,
 but capturing it needs platform-level scheduling diagnosis (ETW tracing of
 where members stall; OpenMP-style adaptive barriers) rather than more
-kernel work. The next levers that do NOT depend on lockstep: batched
-prefill (their 328 vs our ~30 tok/s prompt phase), f16 KV cache, AVX-VNNI
-dots, and speculative decoding — the one lever that can put effective
-decode throughput *above* llama.cpp's.
+kernel work. Two of the non-lockstep levers are now in: prefill positions
+skip the LM head (llama.cpp's `inp_out_ids` trick — the head is ~30% of
+per-token weight traffic on a 152k vocab), and the prompt is
+**batch-prefilled** in one pass with weight-row-outer matmuls (each weight
+row streams from DRAM once for the whole batch), bit-identical to
+sequential prefill by test and measured 1.4x on a thermally-throttled
+machine (21.4 -> 29.0 tok/s end-to-end on a 59-token prompt; the batched
+path is compute-bound, so a cool machine gains more). Remaining prefill
+headroom: a register-blocked micro-kernel (unpack a weight row's nibbles
+once for several activation rows — llama.cpp/llamafile's remaining edge)
+and AVX-VNNI. Remaining decode levers: f16 KV cache and speculative
+decoding — the one that can put effective decode throughput *above*
+llama.cpp's.
 
 Everything above the kernel boundary is `#![forbid(unsafe_code)]`; the Phase 0
 crate concentrates the workspace's entire `unsafe` FFI surface into one

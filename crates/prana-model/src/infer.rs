@@ -5,8 +5,9 @@
 //! Gemma's √dim embedding scale.
 
 use prana_kernels::{
-    attention_decode, attention_decode_team, gelu_tanh, matmul_f32_team, matmul_kquant_team,
-    quantize_acts, rmsnorm, rope_interleaved, rope_neox, run_team, silu, Team, TeamCell,
+    attention, attention_decode, attention_decode_team, gelu_tanh, matmul_f32_team,
+    matmul_kquant_team, quantize_acts, rmsnorm, rope_interleaved, rope_neox, run_team, silu,
+    QuantActs, Team, TeamCell,
 };
 
 use crate::checkpoint::{Activation, Embedding, Model};
@@ -200,6 +201,81 @@ fn forward_impl(
     }
     let x = timed(4, || rmsnorm(&x, &model.rms_final, 1, dim, c.norm_eps));
     Some(timed(2, || model.logits(&x)))
+}
+
+/// Batch-process `tokens` at positions `0..tokens.len()`, filling the KV
+/// cache. No logits — the caller's decode loop re-enters at the last
+/// prompt position. Weight rows stream once per matmul for the whole batch
+/// (row-outer kernels), which is what makes prompt processing several times
+/// faster than token-by-token forwards; the batch attention kernel shares
+/// its accumulation order with the decode path, so the resulting cache and
+/// downstream logits are bit-identical to sequential prefill.
+pub fn prefill(model: &Model, cache: &mut KvCache, tokens: &[u32]) {
+    let c = &model.config;
+    let (dim, head_dim, kv_dim, q_dim) = (c.dim, c.head_dim, c.kv_dim(), c.q_dim());
+    let n = tokens.len();
+
+    let mut x = Vec::with_capacity(n * dim);
+    for &t in tokens {
+        x.extend(model.tok_emb.row(t as usize, dim));
+    }
+    if c.emb_scale != 1.0 {
+        for v in x.iter_mut() {
+            *v *= c.emb_scale;
+        }
+    }
+
+    let row_acts = |xs: &[f32], width: usize| -> Vec<QuantActs> {
+        xs.chunks_exact(width).map(quantize_acts).collect()
+    };
+
+    for (l, layer) in model.layers.iter().enumerate() {
+        // --- attention block ---
+        let xb = rmsnorm(&x, &layer.rms_att, n, dim, c.norm_eps);
+        let acts = row_acts(&xb, dim);
+        let mut q = layer.wq.apply_prefill(&xb, &acts);
+        let mut k = layer.wk.apply_prefill(&xb, &acts);
+        let mut v = layer.wv.apply_prefill(&xb, &acts);
+        for t in 0..n {
+            add_bias(&mut q[t * q_dim..(t + 1) * q_dim], &layer.bq);
+            add_bias(&mut k[t * kv_dim..(t + 1) * kv_dim], &layer.bk);
+            add_bias(&mut v[t * kv_dim..(t + 1) * kv_dim], &layer.bv);
+            if c.rope_neox {
+                rope_neox(&mut q[t * q_dim..(t + 1) * q_dim], t, head_dim, c.rope_theta);
+                rope_neox(&mut k[t * kv_dim..(t + 1) * kv_dim], t, head_dim, c.rope_theta);
+            } else {
+                rope_interleaved(&mut q[t * q_dim..(t + 1) * q_dim], t, head_dim, c.rope_theta);
+                rope_interleaved(&mut k[t * kv_dim..(t + 1) * kv_dim], t, head_dim, c.rope_theta);
+            }
+        }
+        cache.k[l].get_mut()[..n * kv_dim].copy_from_slice(&k);
+        cache.v[l].get_mut()[..n * kv_dim].copy_from_slice(&v);
+
+        let attn = attention(&q, &k, &v, n, c.n_heads, c.n_kv_heads, head_dim);
+        let acts_attn = row_acts(&attn, q_dim);
+        let o = layer.wo.apply_prefill(&attn, &acts_attn);
+        for (xi, oi) in x.iter_mut().zip(o) {
+            *xi += oi;
+        }
+
+        // --- gated MLP block ---
+        let xb = rmsnorm(&x, &layer.rms_ffn, n, dim, c.norm_eps);
+        let acts = row_acts(&xb, dim);
+        let mut gate = layer.w1.apply_prefill(&xb, &acts);
+        let up = layer.w3.apply_prefill(&xb, &acts);
+        match c.act {
+            Activation::Silu => silu(&mut gate),
+            Activation::GeluTanh => gelu_tanh(&mut gate),
+        }
+        for (g, u) in gate.iter_mut().zip(&up) {
+            *g *= u;
+        }
+        let acts_h = row_acts(&gate, c.hidden_dim);
+        let down = layer.w2.apply_prefill(&gate, &acts_h);
+        for (xi, di) in x.iter_mut().zip(down) {
+            *xi += di;
+        }
+    }
 }
 
 /// One token through the model as a **team**: a single pool dispatch per
@@ -402,7 +478,22 @@ pub fn generate(
     let mut token = prompt_tokens[0];
     let mut generated = 0usize;
 
-    for pos in 0..max_pos {
+    // Batch-prefill all but the last prompt token in one pass (the decode
+    // loop re-enters at the last one and produces the first logits). The
+    // per-token path is kept for PRANA_TIMING so the profiler sees the
+    // whole model.
+    let p = prompt_tokens.len();
+    let mut start_pos = 0;
+    if p > 1 && p <= max_pos && !timing_enabled() {
+        prefill(model, &mut cache, &prompt_tokens[..p - 1]);
+        for w in prompt_tokens.windows(2) {
+            on_piece(&tokenizer.decode(w[0], w[1]), true);
+        }
+        start_pos = p - 1;
+        token = prompt_tokens[p - 1];
+    }
+
+    for pos in start_pos..max_pos {
         // Teacher-forced prefill positions never read their logits, so the
         // LM head (the model's single largest matmul) is skipped for them —
         // llama.cpp's `inp_out_ids` trick.
