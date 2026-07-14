@@ -125,6 +125,20 @@ fn timed<T>(slot: usize, f: impl FnOnce() -> T) -> T {
 /// Run one token through the model at position `pos`, updating the cache.
 /// Returns the vocabulary logits.
 pub fn forward(model: &Model, cache: &mut KvCache, token: u32, pos: usize) -> Vec<f32> {
+    forward_impl(model, cache, token, pos, true).expect("logits requested")
+}
+
+/// [`forward`] with the LM head optional: teacher-forced prefill positions
+/// never look at their logits, and the head is the single largest matmul in
+/// the model (vocab × dim — ~30% of per-token weight traffic on a 152k-vocab
+/// 0.5B). llama.cpp's graphs do the same via `inp_out_ids`/`get_rows`.
+fn forward_impl(
+    model: &Model,
+    cache: &mut KvCache,
+    token: u32,
+    pos: usize,
+    need_logits: bool,
+) -> Option<Vec<f32>> {
     let c = &model.config;
     let dim = c.dim;
     let head_dim = c.head_dim;
@@ -181,8 +195,11 @@ pub fn forward(model: &Model, cache: &mut KvCache, token: u32, pos: usize) -> Ve
         }
     }
 
+    if !need_logits {
+        return None;
+    }
     let x = timed(4, || rmsnorm(&x, &model.rms_final, 1, dim, c.norm_eps));
-    timed(2, || model.logits(&x))
+    Some(timed(2, || model.logits(&x)))
 }
 
 /// One token through the model as a **team**: a single pool dispatch per
@@ -198,8 +215,19 @@ pub fn forward_team(
     token: u32,
     pos: usize,
 ) -> Vec<f32> {
-    run_team(|team| forward_team_member(model, cache, scratch, token, pos, &team));
-    scratch.logits.read().clone()
+    forward_team_impl(model, cache, scratch, token, pos, true).expect("logits requested")
+}
+
+fn forward_team_impl(
+    model: &Model,
+    cache: &KvCache,
+    scratch: &Scratch,
+    token: u32,
+    pos: usize,
+    need_logits: bool,
+) -> Option<Vec<f32>> {
+    run_team(|team| forward_team_member(model, cache, scratch, token, pos, need_logits, &team));
+    need_logits.then(|| scratch.logits.read().clone())
 }
 
 /// The per-member body of [`forward_team`]. Every member runs this whole
@@ -220,6 +248,7 @@ fn forward_team_member(
     scratch: &Scratch,
     token: u32,
     pos: usize,
+    need_logits: bool,
     team: &Team,
 ) {
     let c = &model.config;
@@ -329,7 +358,12 @@ fn forward_team_member(
         }
     }
 
-    // --- classifier ---
+    // --- classifier (skipped for teacher-forced prefill positions; the
+    // condition is identical on every member, so barrier counts stay
+    // uniform) ---
+    if !need_logits {
+        return;
+    }
     let xb = rmsnorm(&x, &model.rms_final, 1, dim, c.norm_eps);
     let acts = quantize_acts(&xb);
     match (&model.wcls, &model.tok_emb) {
@@ -369,6 +403,10 @@ pub fn generate(
     let mut generated = 0usize;
 
     for pos in 0..max_pos {
+        // Teacher-forced prefill positions never read their logits, so the
+        // LM head (the model's single largest matmul) is skipped for them —
+        // llama.cpp's `inp_out_ids` trick.
+        let need_logits = pos + 1 >= prompt_tokens.len() && pos + 1 < max_pos;
         // Measured on Ultra-5-class hybrid Windows hardware, the per-op pool
         // path outruns team execution (~29 vs ~21 tok/s on a 0.5B q4_0):
         // both leave the small QKV/O projections serial, but the team's
@@ -378,9 +416,9 @@ pub fn generate(
         // its barrier costs measure healthy (~1-2µs), so it should win once
         // the serial glue itself is parallelized. See EVALUATION.md.
         let logits = if team_enabled() {
-            forward_team(model, &cache, &scratch, token, pos)
+            forward_team_impl(model, &cache, &scratch, token, pos, need_logits)
         } else {
-            forward(model, &mut cache, token, pos)
+            forward_impl(model, &mut cache, token, pos, need_logits)
         };
         if pos + 1 >= max_pos {
             break; // context full: the next token would have nowhere to sit
@@ -388,7 +426,7 @@ pub fn generate(
         let next = if pos + 1 < prompt_tokens.len() {
             prompt_tokens[pos + 1] // teacher-force the rest of the prompt
         } else {
-            sampler.sample(&logits)
+            sampler.sample(&logits.expect("logits computed for sampled positions"))
         };
         if pos + 1 >= prompt_tokens.len() {
             if tokenizer.is_stop(next) {
